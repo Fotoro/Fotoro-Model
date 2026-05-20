@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+venv/
+.env/
+
+# Model caches
+cache/
+models/
+
+# Generated indexes/data
+index/
+face_crops/
+person_albums/
+
+# User/private images
+images/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# HuggingFace cache
+.huggingface/
