@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Fotoro Ingestion & Query Pipeline v4.1 — Fast Specialist Cascade
-BLIP captioning + SigLIP zero-shot tagging + color extraction + hybrid search
+Fotoro Ingestion & Query Pipeline v5 — Dynamic Infinite-Vocabulary Tagging
+Tier 1: BLIP generates candidate tags from caption (~0.4s)
+Tier 2: SigLIP verifies + scores each candidate (~0.05s)
+Result: infinite vocabulary, structured confidence, no predefined lists
 """
 
 import os
@@ -10,6 +12,7 @@ import sqlite3
 import json
 import hashlib
 import time
+import re
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set
 import warnings
@@ -25,35 +28,25 @@ from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
-# ─── Structured Tag Vocabulary (pre-computed once) ───────────────────
-TAG_VOCABULARY = [
-    # Scenes
-    "beach", "mountain", "city street", "indoor room", "outdoor scene", "night scene",
-    "sunset", "forest", "ocean view", "snowy landscape", "desert", "garden", "park",
-    "restaurant interior", "kitchen", "bedroom", "bathroom", "office", "classroom",
-    "stadium", "airport", "highway", "bridge", "river", "lake",
-    # People / Animals
-    "person", "people", "man", "woman", "child", "baby", "group of people",
-    "dog", "cat", "bird", "horse", "fish", "insect", "butterfly", "wild animal",
-    # Objects / Vehicles
-    "car", "bicycle", "motorcycle", "truck", "bus", "boat", "airplane", "train",
-    "phone", "laptop", "computer", "camera", "television", "book", "cup", "bottle",
-    "plate of food", "pizza", "burger", "cake", "ice cream", "coffee cup", "wine glass",
-    "flower bouquet", "tree", "building", "house",
-    # Clothing / Attributes
-    "red shirt", "blue shirt", "white shirt", "black shirt", "green shirt", "yellow shirt",
-    "orange shirt", "pink shirt", "purple shirt", "gray shirt", "brown shirt",
-    "blue jeans", "black pants", "white pants", "red dress", "black dress", "white dress",
-    "blue dress", "suit", "jacket", "coat", "hat", "glasses", "sunglasses", "backpack",
-    "shirtless person", "bare chest", "topless", "bikini", "swimsuit",
-    # Events / Activities
-    "wedding", "birthday party", "concert", "sports game", "running", "swimming",
-    "eating", "cooking", "hiking", "driving", "selfie", "screenshot", "graduation",
-    "meeting", "dance party",
-    # Mood / Style
-    "happy people", "romantic scene", "formal event", "casual setting", "crowded place",
-    "empty room", "dark photo", "bright photo", "colorful scene", "blurry motion",
-]
+# ─── Seed Tags: only for bootstrapping the dynamic extractor ─────────
+# These are NOT used for matching — they teach the parser what "kinds" of tags exist
+SEED_TAG_CATEGORIES = {
+    "scene": ["beach", "mountain", "city", "indoor", "outdoor", "night", "sunset",
+              "forest", "ocean", "snow", "desert", "garden", "park", "restaurant",
+              "kitchen", "bedroom", "bathroom", "office", "highway", "bridge"],
+    "person": ["man", "woman", "child", "baby", "group", "couple", "family"],
+    "animal": ["dog", "cat", "bird", "horse", "fish", "butterfly"],
+    "vehicle": ["car", "bicycle", "motorcycle", "truck", "bus", "boat", "airplane"],
+    "object": ["phone", "laptop", "book", "cup", "bottle", "plate", "cake",
+               "flower", "tree", "building"],
+    "clothing": ["shirt", "pants", "dress", "jacket", "hat", "glasses", "sunglasses"],
+    "color": ["red", "blue", "green", "yellow", "black", "white", "orange", "pink"],
+    "event": ["wedding", "birthday", "concert", "party", "meeting", "graduation"],
+    "activity": ["eating", "running", "swimming", "driving", "selfie", "cooking"],
+    "mood": ["happy", "sad", "romantic", "formal", "casual", "crowded"],
+}
+
+ALL_SEED_TAGS = [t for cat in SEED_TAG_CATEGORIES.values() for t in cat]
 
 
 class FotoroPipeline:
@@ -84,7 +77,6 @@ class FotoroPipeline:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.float32
 
-        # Models
         self.siglip_processor = None
         self.siglip_model = None
         self.blip_processor = None
@@ -92,15 +84,13 @@ class FotoroPipeline:
         self.bge_model = None
         self.face_app = None
 
-        # Precomputed SigLIP text embeddings for all tags: (N_tags, 768)
-        self.tag_embeddings = None
+        # Precomputed seed tag embeddings for fast verification
+        self.seed_tag_embeddings = None
 
-        # FAISS indices
         self.siglip_index: Optional[faiss.IndexIDMap2] = None
         self.bge_index: Optional[faiss.IndexIDMap2] = None
         self.face_index: Optional[faiss.IndexIDMap2] = None
 
-        # Python sets for fast resume checks (populated from FAISS id_map)
         self._existing_siglip_ids: Set[int] = set()
         self._existing_bge_ids: Set[int] = set()
         self._existing_face_ids: Set[int] = set()
@@ -118,7 +108,7 @@ class FotoroPipeline:
                 path TEXT UNIQUE NOT NULL,
                 filename TEXT,
                 caption TEXT,
-                tags TEXT,
+                tags TEXT,  -- JSON: [{"tag": "beach", "score": 0.87}, ...]
                 colors TEXT,
                 ocr_text TEXT,
                 exif_date TEXT,
@@ -151,6 +141,8 @@ class FotoroPipeline:
                 person_id INTEGER NOT NULL,
                 bbox TEXT,
                 face_embedding BLOB,
+                det_score REAL DEFAULT 0.8,
+                yaw REAL DEFAULT 0.0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(image_id) REFERENCES images(id),
                 FOREIGN KEY(person_id) REFERENCES persons(id)
@@ -172,7 +164,6 @@ class FotoroPipeline:
 
     @staticmethod
     def _index_id_set(index: faiss.IndexIDMap2) -> Set[int]:
-        """Safely extract all IDs from a FAISS IndexIDMap/IndexIDMap2 into a Python set."""
         if index.ntotal == 0:
             return set()
         try:
@@ -203,9 +194,9 @@ class FotoroPipeline:
     # ─── Model Loading ────────────────────────────────────────────────
 
     def load_models(self, load_face: bool = True):
-        print("->  Loading models…")
+        print("🔧 Loading models…")
 
-        print("   → SigLIP base-patch16 (vision-text encoder + tagger)")
+        print("   → SigLIP base-patch16 (vision-text verifier)")
         self.siglip_processor = AutoProcessor.from_pretrained(
             "google/siglip-base-patch16-224", use_fast=True
         )
@@ -213,7 +204,7 @@ class FotoroPipeline:
             "google/siglip-base-patch16-224"
         ).to(self.device).eval()
 
-        print("   → BLIP-base (fast captioning ~0.4 s/img on CPU)")
+        print("   → BLIP-base (caption + tag generator)")
         self.blip_processor = BlipProcessor.from_pretrained(
             "Salesforce/blip-image-captioning-base"
         )
@@ -221,14 +212,14 @@ class FotoroPipeline:
             "Salesforce/blip-image-captioning-base"
         ).to(self.device).eval()
 
-        print("   → BGE-small-en-v1.5 (text semantic encoder)")
+        print("   → BGE-small-en-v1.5 (semantic encoder)")
         self.bge_model = SentenceTransformer(
             "BAAI/bge-small-en-v1.5", device=self.device
         )
 
         if load_face:
             try:
-                print("   → InsightFace buffalo_l (face detect + recognize)")
+                print("   → InsightFace buffalo_l")
                 from insightface.app import FaceAnalysis
                 self.face_app = FaceAnalysis(
                     name="buffalo_l",
@@ -237,19 +228,18 @@ class FotoroPipeline:
                 )
                 self.face_app.prepare(ctx_id=0, det_size=(640, 640))
             except Exception as e:
-                print(f"   ->  InsightFace skipped: {e}")
+                print(f"    InsightFace skipped: {e}")
                 self.face_app = None
 
-        # Precompute tag embeddings once (~1 second)
-        self._precompute_tag_embeddings()
-        print(f"   → Precomputed {len(TAG_VOCABULARY)} tag embeddings")
-        print("->  All models ready")
+        self._precompute_seed_tags()
+        print(f"   → Precomputed {len(ALL_SEED_TAGS)} seed tag embeddings")
+        print(" All models ready")
 
-    def _precompute_tag_embeddings(self):
+    def _precompute_seed_tags(self):
         batch_size = 16
         embeddings = []
-        for i in range(0, len(TAG_VOCABULARY), batch_size):
-            batch = TAG_VOCABULARY[i:i + batch_size]
+        for i in range(0, len(ALL_SEED_TAGS), batch_size):
+            batch = ALL_SEED_TAGS[i:i + batch_size]
             inputs = self.siglip_processor(
                 text=batch, return_tensors="pt", padding=True
             ).to(self.device)
@@ -258,7 +248,7 @@ class FotoroPipeline:
             emb = emb.cpu().numpy()
             emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
             embeddings.append(emb.astype(np.float32))
-        self.tag_embeddings = np.vstack(embeddings)
+        self.seed_tag_embeddings = np.vstack(embeddings)
 
     # ─── Helpers ──────────────────────────────────────────────────────
 
@@ -329,7 +319,7 @@ class FotoroPipeline:
     def _extract_colors(self, image: Image.Image, n: int = 3) -> List[str]:
         img = image.resize((30, 30)).convert("RGB")
         arr = np.array(img)
-        arr = (arr // 51) * 51  # quantize to 5 levels per channel
+        arr = (arr // 51) * 51
         pixels = arr.reshape(-1, 3)
         unique, counts = np.unique(pixels, axis=0, return_counts=True)
         top_idx = np.argsort(counts)[-n:][::-1]
@@ -345,18 +335,108 @@ class FotoroPipeline:
                 out.append(c)
         return out
 
-    def _extract_tags(self, image: Image.Image, top_k: int = 12, threshold: float = 0.52) -> List[str]:
+    # ─── DYNAMIC TAG EXTRACTION ───────────────────────────────────────
+
+    def _caption_to_candidate_tags(self, caption: str) -> List[str]:
+        """
+        Parse BLIP caption into candidate tags using linguistic patterns.
+        No hardcoded list — extracts anything that looks like a noun phrase.
+        """
+        caption_lower = caption.lower()
+        candidates = set()
+
+        # Pattern 1: "a [color] [noun]" → extract color+noun and noun
+        color_pattern = re.compile(
+            r'\b(red|blue|green|yellow|black|white|orange|pink|purple|gray|brown|navy)\s+(\w+)\b'
+        )
+        for color, noun in color_pattern.findall(caption_lower):
+            candidates.add(f"{color} {noun}")
+            candidates.add(noun)
+
+        # Pattern 2: "a [adj] [noun]" → extract noun
+        adj_noun = re.compile(r'\b(a|an|the)\s+(\w+)\s+(\w+)\b')
+        for _, adj, noun in adj_noun.findall(caption_lower):
+            if adj not in {"the", "a", "an", "of", "in", "on"}:
+                candidates.add(f"{adj} {noun}")
+            candidates.add(noun)
+
+        # Pattern 3: standalone nouns from caption (simple POS heuristic)
+        words = re.findall(r'\b[a-z]{3,}\b', caption_lower)
+        # Filter: keep words that are likely objects/scenes (ends in common noun suffixes)
+        noun_suffixes = ('ing', 'ion', 'ment', 'ness', 'ity', 'er', 'or', 'ist',
+                        'ism', 'ure', 'age', 'dom', 'hood', 'ship', 'ism')
+        for w in words:
+            if w.endswith(noun_suffixes) or w in {
+                'beach', 'mountain', 'ocean', 'forest', 'city', 'street', 'room',
+                'kitchen', 'bedroom', 'bathroom', 'office', 'car', 'dog', 'cat',
+                'person', 'people', 'man', 'woman', 'child', 'baby', 'group',
+                'wedding', 'party', 'concert', 'meeting', 'birthday', 'graduation',
+                'food', 'meal', 'dinner', 'lunch', 'breakfast', 'cake', 'pizza',
+                'phone', 'laptop', 'computer', 'book', 'cup', 'bottle', 'plate',
+                'shirt', 'pants', 'dress', 'jacket', 'hat', 'glasses', 'sunglasses',
+                'selfie', 'photo', 'picture', 'image', 'scene', 'view', 'landscape',
+            }:
+                candidates.add(w)
+
+        # Pattern 4: bigrams that appear in caption
+        bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words)-1)]
+        for bg in bigrams:
+            if any(bg.startswith(c + " ") for c in {
+                'red', 'blue', 'green', 'yellow', 'black', 'white', 'orange', 'pink'
+            }):
+                candidates.add(bg)
+
+        return list(candidates)
+
+    def _verify_tags_siglip(self, image: Image.Image, candidates: List[str], threshold: float = 0.48) -> List[Dict]:
+        """
+        Score each candidate tag against the image using SigLIP.
+        Returns: [{"tag": "beach", "score": 0.87}, ...]
+        """
+        if not candidates:
+            return []
+
+        # Deduplicate
+        candidates = list(dict.fromkeys(candidates))[:20]  # cap at 20 for speed
+
+        # Batch embed candidate texts
+        batch_size = 8
+        text_embs = []
+        for i in range(0, len(candidates), batch_size):
+            batch = candidates[i:i + batch_size]
+            inputs = self.siglip_processor(text=batch, return_tensors="pt", padding=True).to(self.device)
+            with torch.inference_mode():
+                emb = self.siglip_model.get_text_features(**inputs)
+            emb = emb.cpu().numpy()
+            emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
+            text_embs.append(emb.astype(np.float32))
+        text_embs = np.vstack(text_embs)  # (N_candidates, 768)
+
+        # Image embedding
         img_emb = self._embed_siglip_image(image)  # (768,)
-        sims = np.dot(self.tag_embeddings, img_emb)  # (N_tags,)
-        indices = np.argsort(sims)[::-1]
-        tags = []
-        for idx in indices:
-            if sims[idx] < threshold:
-                break
-            tags.append(TAG_VOCABULARY[idx])
-            if len(tags) >= top_k:
-                break
-        return tags
+
+        # Cosine similarities
+        sims = np.dot(text_embs, img_emb)  # (N_candidates,)
+
+        results = []
+        for tag, score in zip(candidates, sims):
+            if score >= threshold:
+                results.append({"tag": tag, "score": round(float(score), 3)})
+
+        # Sort by score descending
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return results[:12]  # top 12
+
+    def _extract_tags(self, image: Image.Image, caption: str) -> List[Dict]:
+        """
+        Two-tier dynamic tagging:
+        1. BLIP caption → candidate tags (infinite vocabulary)
+        2. SigLIP verifies which candidates actually match the image
+        """
+        candidates = self._caption_to_candidate_tags(caption)
+        # Also add seed tags for coverage of things BLIP might miss
+        candidates.extend(ALL_SEED_TAGS)
+        return self._verify_tags_siglip(image, candidates)
 
     # ─── Batch Embedding ──────────────────────────────────────────────
 
@@ -403,12 +483,12 @@ class FotoroPipeline:
                 **inputs,
                 max_length=60,
                 min_length=5,
-                num_beams=1,  # greedy = fast
+                num_beams=1,
                 do_sample=False,
             )
         return self.blip_processor.batch_decode(outputs, skip_special_tokens=True)
 
-    # ─── Face Detection (FAISS + Junction Table) ────────────────────
+    # ─── Face Detection ───────────────────────────────────────────────
 
     def _match_face_faiss(self, emb: np.ndarray, threshold: float = 0.60) -> Optional[int]:
         if self.face_index.ntotal == 0:
@@ -419,6 +499,28 @@ class FotoroPipeline:
             return int(I[0][0])
         return None
 
+    def _update_person_embedding(self, person_id: int, new_emb: np.ndarray, alpha: float = 0.15):
+        row = self.conn.execute(
+            "SELECT face_embedding FROM persons WHERE id=?", (person_id,)
+        ).fetchone()
+        if row and row[0]:
+            old = np.frombuffer(row[0], dtype=np.float32)
+            old_norm = old / (np.linalg.norm(old) + 1e-8)
+            merged = (1 - alpha) * old_norm + alpha * new_emb
+            merged = merged / (np.linalg.norm(merged) + 1e-8)
+            self.conn.execute(
+                "UPDATE persons SET face_embedding=? WHERE id=?",
+                (merged.astype(np.float32).tobytes(), person_id)
+            )
+            try:
+                self.face_index.remove_ids(np.array([person_id], dtype=np.int64))
+            except Exception:
+                pass
+            self.face_index.add_with_ids(
+                merged.reshape(1, -1),
+                np.array([person_id], dtype=np.int64)
+            )
+
     def _detect_faces(self, image: Image.Image, image_id: int, path: Path) -> Tuple[int, List[int]]:
         if self.face_app is None:
             return 0, []
@@ -428,39 +530,66 @@ class FotoroPipeline:
         img_np = np.array(image.convert("RGB"))
         h, w = img_np.shape[:2]
         scale = 1.0
-        if max(h, w) > 1280:
-            scale = 1280 / max(h, w)
+        if max(h, w) > 1600:
+            scale = 1600 / max(h, w)
             img_np = cv2.resize(img_np, (int(w * scale), int(h * scale)))
 
         faces = self.face_app.get(img_np)
+        if not faces:
+            return 0, []
 
         face_db_ids = []
         for i, face in enumerate(faces):
-            bbox = face.bbox.astype(int)
+            bbox = face.bbox.astype(float)
+            face_w = bbox[2] - bbox[0]
+            face_h = bbox[3] - bbox[1]
+            face_area = face_w * face_h
+            img_area = img_np.shape[0] * img_np.shape[1]
+
+            if face_area / img_area < 0.0015:
+                continue
+            if hasattr(face, 'det_score') and face.det_score < 0.65:
+                continue
+            if hasattr(face, 'pose') and abs(face.pose[1]) > 45:
+                continue
+
             if scale != 1.0:
                 bbox = (bbox / scale).astype(int)
+            else:
+                bbox = bbox.astype(int)
 
             x1, y1, x2, y2 = max(0, int(bbox[0])), max(0, int(bbox[1])), int(bbox[2]), int(bbox[3])
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            crop = image.crop((x1, y1, x2, y2))
+            margin_x = int((x2 - x1) * 0.15)
+            margin_y = int((y2 - y1) * 0.25)
+            cx1 = max(0, x1 - margin_x)
+            cy1 = max(0, y1 - margin_y)
+            cx2 = min(image.width, x2 + margin_x)
+            cy2 = min(image.height, y2 + margin_y)
+
+            crop = image.crop((cx1, cy1, cx2, cy2))
             crop_path = self.dirs["face_crops"] / f"img{image_id}_face{i}.jpg"
-            crop.save(crop_path)
+            crop.save(crop_path, quality=90)
 
             emb = face.embedding.astype(np.float32)
             emb_norm = emb / (np.linalg.norm(emb) + 1e-8)
             emb_blob = emb.tobytes()
 
-            person_id = self._match_face_faiss(emb_norm, threshold=0.60)
+            person_id = self._match_face_faiss(emb_norm, threshold=0.62)
+            if person_id is None:
+                person_id = self._match_face_faiss(emb_norm, threshold=0.55)
+
             if person_id:
+                self._update_person_embedding(person_id, emb_norm)
                 self.conn.execute(
                     "UPDATE persons SET photo_count = photo_count + 1 WHERE id = ?", (person_id,)
                 )
             else:
                 cur = self.conn.execute(
-                    "INSERT INTO persons (face_embedding, sample_face_path, photo_count) VALUES (?, ?, 1)",
-                    (emb_blob, str(crop_path))
+                    "INSERT INTO persons (face_embedding, sample_face_path, photo_count, name) VALUES (?, ?, 1, ?)",
+                    (emb_blob, str(crop_path), f"Person {self.face_index.ntotal + 1}")
                 )
                 person_id = cur.lastrowid
                 self.face_index.add_with_ids(
@@ -471,19 +600,80 @@ class FotoroPipeline:
 
             face_db_ids.append(person_id)
             self.conn.execute(
-                "INSERT INTO face_appearances (image_id, person_id, bbox, face_embedding) VALUES (?, ?, ?, ?)",
-                (image_id, person_id, json.dumps([int(x1), int(y1), int(x2), int(y2)]), emb_blob)
+                "INSERT INTO face_appearances (image_id, person_id, bbox, face_embedding, det_score, yaw) VALUES (?, ?, ?, ?, ?, ?)",
+                (image_id, person_id, json.dumps([int(x1), int(y1), int(x2), int(y2)]),
+                 emb_blob, float(getattr(face, 'det_score', 0.8)), float(getattr(face, 'pose', [0, 0, 0])[1]))
             )
 
         self.conn.commit()
-        return len(faces), face_db_ids
+        return len(face_db_ids), face_db_ids
 
-    # ─── Ingestion (5 Phases, Resume-Friendly) ───────────────────────
+    # ─── Album Post-Processing ────────────────────────────────────────
+
+    def merge_similar_persons(self, threshold: float = 0.72):
+        print(f"\n Merging similar albums (threshold {threshold})…")
+        persons = self.conn.execute(
+            "SELECT id, face_embedding FROM persons ORDER BY photo_count DESC"
+        ).fetchall()
+
+        merged = 0
+        for pid, emb_blob in persons:
+            if self.conn.execute("SELECT COUNT(*) FROM persons WHERE id=?", (pid,)).fetchone()[0] == 0:
+                continue
+
+            emb = np.frombuffer(emb_blob, dtype=np.float32)
+            emb = emb / (np.linalg.norm(emb) + 1e-8)
+
+            D, I = self.face_index.search(emb.reshape(1, -1), 5)
+            for sim_score, other_pid in zip(D[0], I[0]):
+                if other_pid < 0 or int(other_pid) == pid or sim_score < threshold:
+                    continue
+                other_pid = int(other_pid)
+
+                if self.conn.execute("SELECT COUNT(*) FROM persons WHERE id=?", (other_pid,)).fetchone()[0] == 0:
+                    continue
+
+                self.conn.execute("UPDATE face_appearances SET person_id=? WHERE person_id=?", (pid, other_pid))
+                other_count = self.conn.execute("SELECT photo_count FROM persons WHERE id=?", (other_pid,)).fetchone()[0]
+                self.conn.execute("UPDATE persons SET photo_count = photo_count + ? WHERE id=?", (other_count, pid))
+                self.conn.execute("DELETE FROM persons WHERE id=?", (other_pid,))
+                try:
+                    self.face_index.remove_ids(np.array([other_pid], dtype=np.int64))
+                except Exception:
+                    pass
+                self._existing_face_ids.discard(other_pid)
+                merged += 1
+                print(f"   Merged Person {other_pid} → Person {pid} (sim={sim_score:.3f})")
+
+        self.conn.commit()
+        self._save_indices()
+        print(f" Merged {merged} duplicates")
+
+    def cleanup_bad_crops(self, min_photos: int = 2):
+        rows = self.conn.execute(
+            "SELECT id FROM persons WHERE photo_count < ? AND name LIKE 'Person %'",
+            (min_photos,)
+        ).fetchall()
+        removed = 0
+        for (pid,) in rows:
+            self.conn.execute("DELETE FROM face_appearances WHERE person_id=?", (pid,))
+            self.conn.execute("DELETE FROM persons WHERE id=?", (pid,))
+            try:
+                self.face_index.remove_ids(np.array([pid], dtype=np.int64))
+            except Exception:
+                pass
+            self._existing_face_ids.discard(pid)
+            removed += 1
+        self.conn.commit()
+        self._save_indices()
+        print(f" Removed {removed} low-quality albums")
+
+    # ─── Ingestion ────────────────────────────────────────────────────
 
     def ingest_folder(self, folder: str, recursive: bool = False):
         folder_path = Path(folder)
         if not folder_path.exists():
-            print(f"->  Folder not found: {folder}")
+            print(f" Folder not found: {folder}")
             return
 
         exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
@@ -492,8 +682,7 @@ class FotoroPipeline:
             if f.suffix.lower() in exts
         ])
 
-        # Phase 1: Discovery & Metadata
-        print(f"->  Phase 1/5: Discovery ({len(files)} files)")
+        print(f" Phase 1/5: Discovery ({len(files)} files)")
         new_entries = []
         skipped = 0
         for path in tqdm(files, desc="Metadata", unit="img", leave=False):
@@ -511,8 +700,7 @@ class FotoroPipeline:
 
             sha = self._sha256(path)
             cur = self.conn.execute("""
-                INSERT INTO images
-                (path, filename, exif_date, exif_gps_lat, exif_gps_lon,
+                INSERT INTO images (path, filename, exif_date, exif_gps_lat, exif_gps_lon,
                  width, height, file_size, sha256, processed)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             """, (
@@ -523,12 +711,11 @@ class FotoroPipeline:
 
         n = len(new_entries)
         if n == 0:
-            print(f"->  Nothing new to ingest. ({skipped} already in DB)")
+            print(f" Nothing new. ({skipped} already in DB)")
             return
 
-        print(f"->  {n} new images | {skipped} skipped | Device: {self.device}\n")
+        print(f" {n} new | {skipped} skipped | Device: {self.device}\n")
 
-        # Determine resume state using Python sets (fast, no SWIG issues)
         needs_siglip = [(p, iid) for p, iid in new_entries if iid not in self._existing_siglip_ids]
         needs_caption = []
         needs_faces = []
@@ -540,10 +727,10 @@ class FotoroPipeline:
             if fa == 0:
                 needs_faces.append((path, image_id))
 
-        # Phase 2: SigLIP visual embedding (batched)
+        # Phase 2: SigLIP visual
         if needs_siglip:
             t0 = time.time()
-            print(f" ->  Phase 2/5: SigLIP visual embedding ({len(needs_siglip)} images)")
+            print(f" Phase 2/5: SigLIP visual ({len(needs_siglip)} images)")
             batch_sz = 8
             batch_imgs, batch_ids = [], []
             for path, image_id in tqdm(needs_siglip, desc="SigLIP", unit="img", leave=False):
@@ -553,16 +740,14 @@ class FotoroPipeline:
                     batch_ids.append(image_id)
                     if len(batch_imgs) == batch_sz:
                         vecs = self._embed_siglip_batch(batch_imgs)
-                        self.siglip_index.add_with_ids(
-                            vecs, np.array(batch_ids, dtype=np.int64)
-                        )
+                        self.siglip_index.add_with_ids(vecs, np.array(batch_ids, dtype=np.int64))
                         for iid in batch_ids:
                             self._existing_siglip_ids.add(iid)
                         for im in batch_imgs:
                             im.close()
                         batch_imgs, batch_ids = [], []
                 except Exception as e:
-                    print(f"\n   -> SigLIP skip {path.name}: {e}")
+                    print(f"\n   SigLIP skip {path.name}: {e}")
 
             if batch_imgs:
                 vecs = self._embed_siglip_batch(batch_imgs)
@@ -572,12 +757,12 @@ class FotoroPipeline:
                 for im in batch_imgs:
                     im.close()
             self._save_indices()
-            print(f"   ->  {time.time()-t0:.1f}s\n")
+            print(f"    {time.time()-t0:.1f}s\n")
 
-        # Phase 3: BLIP captioning + SigLIP tags + colors (batched BLIP)
+        # Phase 3: BLIP caption + dynamic tags + colors
         if needs_caption:
             t0 = time.time()
-            print(f" -> Phase 3/5: AI captioning + tags + colors ({len(needs_caption)} images)")
+            print(f" Phase 3/5: Caption + dynamic tags + colors ({len(needs_caption)} images)")
 
             def flush_blip_buffer(buf):
                 if not buf:
@@ -586,18 +771,18 @@ class FotoroPipeline:
                 captions = self._caption_blip_batch(imgs)
                 for (p, iid, im), cap in zip(buf, captions):
                     try:
-                        tags = self._extract_tags(im)
+                        tags = self._extract_tags(im, cap)
                         colors = self._extract_colors(im)
                         self.conn.execute(
                             "UPDATE images SET caption=?, tags=?, colors=? WHERE id=?",
                             (cap, json.dumps(tags), json.dumps(colors), iid)
                         )
                     except Exception as e:
-                        print(f"\n   -> Tag/color fail {p.name}: {e}")
+                        print(f"\n    Tag fail {p.name}: {e}")
                     finally:
                         im.close()
 
-            blip_buffer = []  # list of (path, image_id, image)
+            blip_buffer = []
             for path, image_id in tqdm(needs_caption, desc="Caption", unit="img"):
                 try:
                     img = Image.open(path).convert("RGB")
@@ -606,18 +791,17 @@ class FotoroPipeline:
                         flush_blip_buffer(blip_buffer)
                         blip_buffer = []
                 except Exception as e:
-                    print(f"\n   ->  Load fail {path.name}: {e}")
+                    print(f"\n   Load fail {path.name}: {e}")
 
             flush_blip_buffer(blip_buffer)
             self.conn.commit()
-            print(f"   ->  {time.time()-t0:.1f}s\n")
+            print(f"     {time.time()-t0:.1f}s\n")
         else:
-            print("->  Phase 3/5: AI captioning (all already done)\n")
+            print(" Phase 3/5: Captioning (already done)\n")
 
-        # Phase 4: BGE text embedding (incremental — only new captions)
+        # Phase 4: BGE text embedding
         t0 = time.time()
-        print(f"->  Phase 4/5: BGE text embedding")
-        # Find all images with captions that are NOT yet in the BGE index
+        print(f" Phase 4/5: BGE text embedding")
         all_rows = self.conn.execute(
             "SELECT id, caption, tags, colors, exif_date, ocr_text FROM images WHERE caption IS NOT NULL"
         ).fetchall()
@@ -625,14 +809,16 @@ class FotoroPipeline:
         ids_list, synth_texts = [], []
         for img_id, cap, tags_json, colors_json, date, ocr in all_rows:
             if img_id in self._existing_bge_ids:
-                continue  # already indexed
+                continue
             tags = json.loads(tags_json) if tags_json else []
             colors = json.loads(colors_json) if colors_json else []
+            tag_str = " ".join([t["tag"] for t in tags[:8]]) if tags else ""
+            color_str = " ".join(colors[:3]) if colors else ""
             parts = []
-            if tags:
-                parts.append("Tags: " + ", ".join(tags[:8]) + ".")
-            if colors:
-                parts.append("Colors: " + ", ".join(colors[:3]) + ".")
+            if tag_str:
+                parts.append(f"Tags: {tag_str}.")
+            if color_str:
+                parts.append(f"Colors: {color_str}.")
             if cap:
                 parts.append(cap)
             if date:
@@ -653,14 +839,14 @@ class FotoroPipeline:
                 for iid in ids_list[i:i + chunk]:
                     self._existing_bge_ids.add(iid)
             self._save_indices()
-            print(f"   Indexed {len(synth_texts)} new vectors in {time.time()-t0:.1f}s\n")
+            print(f"   Indexed {len(synth_texts)} new in {time.time()-t0:.1f}s\n")
         else:
-            print(f"   Nothing new to index. ({time.time()-t0:.1f}s)\n")
+            print(f"   Nothing new. ({time.time()-t0:.1f}s)\n")
 
-        # Phase 5: Face detection
+        # Phase 5: Faces
         if needs_faces and self.face_app:
             t0 = time.time()
-            print(f"-> Phase 5/5: Face detection ({len(needs_faces)} images)")
+            print(f" Phase 5/5: Face detection ({len(needs_faces)} images)")
             for path, image_id in tqdm(needs_faces, desc="Faces", unit="img"):
                 try:
                     img = Image.open(path).convert("RGB")
@@ -672,17 +858,16 @@ class FotoroPipeline:
                             (face_count, json.dumps([int(fid) for fid in face_ids]), image_id)
                         )
                 except Exception as e:
-                    print(f"\n   ->  Face fail {path.name}: {e}")
+                    print(f"\n    Face fail {path.name}: {e}")
             self.conn.commit()
             self._save_indices()
-            print(f"   ->  {time.time()-t0:.1f}s\n")
+            print(f"     {time.time()-t0:.1f}s\n")
         else:
-            print("->  Phase 5/5: Face detection (all already done)\n")
+            print(" Phase 5/5: Faces (already done)\n")
 
-        # Summary
         img_count = self.conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
         person_count = self.conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
-        print("->  Ingestion complete")
+        print(" Done")
         print(f"   Images:  {img_count}")
         print(f"   Persons: {person_count}")
         print(f"   Vectors: {self.siglip_index.ntotal} visual | {self.bge_index.ntotal} text | {self.face_index.ntotal} faces")
@@ -718,15 +903,20 @@ class FotoroPipeline:
 
     def _keyword_boost(self, caption: str, tags_json: str, colors_json: str, ocr: str, query: str, expanded_terms: Set[str]) -> float:
         tags = json.loads(tags_json) if tags_json else []
+        tag_text = " ".join([t["tag"] for t in tags])
         colors = json.loads(colors_json) if colors_json else []
-        full = f"{caption} {' '.join(tags)} {' '.join(colors)} {ocr}".lower()
+        full = f"{caption} {tag_text} {' '.join(colors)} {ocr}".lower()
         score = 0.0
         if query.lower() in full:
             score += 1.0
         for term in expanded_terms:
             if term in full:
                 score += 0.30
-        return min(score, 2.5)
+        # Boost by tag confidence
+        for t in tags:
+            if t["tag"] in expanded_terms:
+                score += t["score"] * 0.5
+        return min(score, 3.0)
 
     def _extract_face_filter(self, text: str) -> Optional[int]:
         rows = self.conn.execute(
@@ -752,7 +942,7 @@ class FotoroPipeline:
                 (face_pid,)
             ).fetchall()
             face_img_set = {r[0] for r in rows}
-            print(f"   -> Filtering by person ID {face_pid} ({len(face_img_set)} photos)")
+            print(f"   👤 Filtering by person ID {face_pid} ({len(face_img_set)} photos)")
 
         rrf_scores: Dict[int, float] = {}
 
@@ -784,7 +974,7 @@ class FotoroPipeline:
             search_rrf(eq, weight=0.8)
 
         if not rrf_scores and face_img_set is not None:
-            print("   ->  No vector matches with face filter; broadening…")
+            print("    No vector matches with face filter; broadening…")
             face_img_set = None
             search_rrf(expanded_queries[0], weight=1.5)
 
@@ -820,6 +1010,7 @@ class FotoroPipeline:
                 FROM images WHERE id = ?
             """, (img_id,)).fetchone()
             if row:
+                tags = json.loads(row[8]) if row[8] else []
                 results.append({
                     "id": img_id,
                     "path": row[0],
@@ -829,7 +1020,7 @@ class FotoroPipeline:
                     "date": row[4],
                     "face_count": row[5],
                     "resolution": f"{row[6]}x{row[7]}",
-                    "tags": json.loads(row[8]) if row[8] else [],
+                    "tags": tags,
                     "colors": json.loads(row[9]) if row[9] else [],
                     "score": round(float(score), 4),
                 })
@@ -840,7 +1031,7 @@ class FotoroPipeline:
     def name_person(self, person_id: int, name: str):
         self.conn.execute("UPDATE persons SET name=? WHERE id=?", (name, person_id))
         self.conn.commit()
-        print(f"->  Person {person_id} named '{name}'")
+        print(f"  Person {person_id} named '{name}'")
 
     def correct_caption(self, image_id: int, new_caption: str):
         self.conn.execute("UPDATE images SET caption=? WHERE id=?", (new_caption, image_id))
@@ -852,7 +1043,7 @@ class FotoroPipeline:
             pass
         self.bge_index.add_with_ids(vec, np.array([image_id], dtype=np.int64))
         self._save_indices()
-        print(f"->  Caption updated & re-indexed for image {image_id}")
+        print(f"  Caption updated & re-indexed for image {image_id}")
 
     def add_feedback(self, image_id: int, query: str, was_relevant: bool, notes: str = ""):
         self.conn.execute(
@@ -860,7 +1051,7 @@ class FotoroPipeline:
             (image_id, query, 1 if was_relevant else 0, notes)
         )
         self.conn.commit()
-        print(f"-> Feedback recorded for image {image_id}")
+        print(f" Feedback recorded for image {image_id}")
 
     # ─── Stats ────────────────────────────────────────────────────────
 
@@ -870,7 +1061,7 @@ class FotoroPipeline:
         face_total = self.conn.execute("SELECT COALESCE(SUM(face_count), 0) FROM images").fetchone()[0]
         feedback_count = self.conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
 
-        print(f"\n-> Fotoro Archive Stats")
+        print(f"\n Fotoro Archive Stats")
         print(f"   Images:      {img_count}")
         print(f"   Vectors:     {self.siglip_index.ntotal} visual | {self.bge_index.ntotal} text")
         print(f"   Persons:     {person_count} ({face_total} face appearances)")

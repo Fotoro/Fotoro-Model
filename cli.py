@@ -48,6 +48,19 @@ def main():
     fb.add_argument("--bad", action="store_true", help="Mark as irrelevant")
     fb.add_argument("--note", default="", help="Optional note")
 
+        # merge-albums
+    ma = subs.add_parser("merge-albums", help="Merge duplicate face albums")
+    ma.add_argument("--threshold", type=float, default=0.72, help="Similarity threshold")
+
+    # cleanup-albums
+    ca = subs.add_parser("cleanup-albums", help="Remove low-quality single-photo albums")
+    ca.add_argument("--min-photos", type=int, default=2, help="Minimum photos to keep")
+
+    # rename-album
+    ra = subs.add_parser("rename-album", help="Rename a person album")
+    ra.add_argument("id", type=int, help="Person ID")
+    ra.add_argument("name", help="New name")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -114,6 +127,17 @@ def main():
 
     elif args.command == "feedback":
         pipe.add_feedback(args.id, args.query, not args.bad, args.note)
+
+    elif args.command == "merge-albums":
+        pipe.load_models(load_face=True)
+        pipe.merge_similar_persons(threshold=args.threshold)
+
+    elif args.command == "cleanup-albums":
+        pipe.load_models(load_face=True)
+        pipe.cleanup_bad_crops(min_photos=args.min_photos)
+
+    elif args.command == "rename-album":
+        pipe.name_person(args.id, args.name)
 
 
 if __name__ == "__main__":
