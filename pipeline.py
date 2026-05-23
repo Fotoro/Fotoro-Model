@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
-Fotoro Ingestion & Query Pipeline v5 — Dynamic Infinite-Vocabulary Tagging
-Tier 1: BLIP generates candidate tags from caption (~0.4s)
-Tier 2: SigLIP verifies + scores each candidate (~0.05s)
-Result: infinite vocabulary, structured confidence, no predefined lists
+Fotoro Ingestion & Query Pipeline v7.2 — Latency-First Architecture
+Targets: 0.05-0.15 s/img on CPU for 500K photo libraries
+
+WIPE PREVIOUS DATA:
+    rm -f cache/fotoro.db index/*.faiss && rm -rf face_crops/* person_albums/*
+
+- SigLIP zero-shot tags (no BLIP for 90% of images)
+- BLIP only for low-confidence images, greedy decode, batch 32
+- Batch 64 for SigLIP, resize 384 (native + margin)
+- Face detection: 1 worker, 640px, skip if no person tags
 """
 
 import os
@@ -13,8 +19,11 @@ import json
 import hashlib
 import time
 import re
+import gc
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
 import warnings
 
 import numpy as np
@@ -28,25 +37,43 @@ from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
-# ─── Seed Tags: only for bootstrapping the dynamic extractor ─────────
-# These are NOT used for matching — they teach the parser what "kinds" of tags exist
-SEED_TAG_CATEGORIES = {
-    "scene": ["beach", "mountain", "city", "indoor", "outdoor", "night", "sunset",
-              "forest", "ocean", "snow", "desert", "garden", "park", "restaurant",
-              "kitchen", "bedroom", "bathroom", "office", "highway", "bridge"],
-    "person": ["man", "woman", "child", "baby", "group", "couple", "family"],
-    "animal": ["dog", "cat", "bird", "horse", "fish", "butterfly"],
-    "vehicle": ["car", "bicycle", "motorcycle", "truck", "bus", "boat", "airplane"],
-    "object": ["phone", "laptop", "book", "cup", "bottle", "plate", "cake",
-               "flower", "tree", "building"],
-    "clothing": ["shirt", "pants", "dress", "jacket", "hat", "glasses", "sunglasses"],
-    "color": ["red", "blue", "green", "yellow", "black", "white", "orange", "pink"],
-    "event": ["wedding", "birthday", "concert", "party", "meeting", "graduation"],
-    "activity": ["eating", "running", "swimming", "driving", "selfie", "cooking"],
-    "mood": ["happy", "sad", "romantic", "formal", "casual", "crowded"],
-}
+# --- Expanded Tag Vocabulary (235 tags for zero-shot) ------
+TAG_VOCABULARY = [
+    "beach", "mountain", "city", "indoor", "outdoor", "night", "sunset", "sunrise",
+    "forest", "ocean", "snow", "desert", "garden", "park", "restaurant", "cafe",
+    "kitchen", "bedroom", "bathroom", "office", "highway", "bridge", "street", "alley",
+    "mall", "store", "library", "classroom", "hospital", "airport", "train station",
+    "stadium", "theater", "museum", "church", "temple", "mosque", "castle", "ruins",
+    "camping", "hiking trail", "lake", "river", "waterfall", "canyon", "island",
+    "man", "woman", "child", "baby", "group of people", "couple", "family", "crowd",
+    "selfie", "portrait", "wedding", "bride", "groom", "graduation", "birthday party",
+    "concert", "festival", "protest", "parade", "meeting", "presentation", "interview",
+    "athlete", "dancer", "musician", "chef", "doctor", "police", "soldier",
+    "dog", "puppy", "cat", "kitten", "bird", "horse", "fish", "butterfly", "bee",
+    "spider", "snake", "elephant", "lion", "tiger", "bear", "deer", "rabbit",
+    "car", "sports car", "bicycle", "motorcycle", "truck", "bus", "boat", "ship",
+    "airplane", "helicopter", "train", "subway", "taxi", "ambulance", "fire truck",
+    "phone", "smartphone", "laptop", "computer", "tablet", "book", "newspaper",
+    "cup", "coffee cup", "mug", "bottle", "wine bottle", "plate", "bowl", "cake",
+    "pizza", "burger", "sushi", "salad", "sandwich", "flower", "bouquet", "tree",
+    "palm tree", "christmas tree", "building", "skyscraper", "house", "tent", "umbrella",
+    "balloon", "kite", "flag", "sign", "poster", "billboard", "statue", "fountain",
+    "shirt", "t-shirt", "pants", "jeans", "dress", "skirt", "jacket", "coat", "suit",
+    "hat", "cap", "glasses", "sunglasses", "watch", "necklace", "ring", "backpack",
+    "handbag", "suitcase", "luggage",
+    "red", "blue", "green", "yellow", "black", "white", "orange", "pink", "purple",
+    "brown", "gray", "gold", "silver",
+    "eating", "drinking", "cooking", "running", "walking", "swimming", "driving",
+    "riding", "flying", "dancing", "singing", "playing music", "reading", "writing",
+    "painting", "photographing", "shopping", "working", "studying", "sleeping",
+    "talking", "laughing", "crying", "kissing", "hugging", "fighting", "exercising",
+    "happy", "sad", "romantic", "formal", "casual", "professional", "vintage",
+    "blurry", "overexposed", "underexposed", "noisy", "grainy", "sharp", "colorful",
+    "food", "meal", "breakfast", "lunch", "dinner", "dessert", "fruit", "vegetable",
+    "meat", "seafood", "pasta", "rice", "bread", "cheese", "chocolate", "ice cream",
+]
 
-ALL_SEED_TAGS = [t for cat in SEED_TAG_CATEGORIES.values() for t in cat]
+ALL_TAGS = list(dict.fromkeys(TAG_VOCABULARY))
 
 
 class FotoroPipeline:
@@ -65,9 +92,9 @@ class FotoroPipeline:
         os.environ["TRANSFORMERS_CACHE"] = str(self.dirs["models"])
         os.environ["HF_HOME"] = str(self.dirs["models"])
 
-        cpu_cores = os.cpu_count() or 4
-        torch.set_num_threads(min(4, cpu_cores))
-        torch.set_num_interop_threads(2)
+        self._n_workers = max(1, (cpu_count() or 4) - 1)
+        torch.set_num_threads(2)
+        torch.set_num_interop_threads(1)
 
         self.db_path = self.dirs["cache"] / "fotoro.db"
         self.siglip_index_path = self.dirs["index"] / "siglip.faiss"
@@ -79,13 +106,14 @@ class FotoroPipeline:
 
         self.siglip_processor = None
         self.siglip_model = None
+        self._siglip_onnx_session = None
         self.blip_processor = None
         self.blip_model = None
         self.bge_model = None
         self.face_app = None
 
-        # Precomputed seed tag embeddings for fast verification
-        self.seed_tag_embeddings = None
+        self._tag_embeddings: Optional[np.ndarray] = None
+        self._tag_list: List[str] = []
 
         self.siglip_index: Optional[faiss.IndexIDMap2] = None
         self.bge_index: Optional[faiss.IndexIDMap2] = None
@@ -98,7 +126,7 @@ class FotoroPipeline:
         self._init_db()
         self._init_faiss()
 
-    # ─── DB ─────────────────────────────────────────────────────────────
+    # --- DB ------------------------------------------------------------
 
     def _init_db(self):
         self.conn = sqlite3.connect(self.db_path)
@@ -108,7 +136,7 @@ class FotoroPipeline:
                 path TEXT UNIQUE NOT NULL,
                 filename TEXT,
                 caption TEXT,
-                tags TEXT,  -- JSON: [{"tag": "beach", "score": 0.87}, ...]
+                tags TEXT,
                 colors TEXT,
                 ocr_text TEXT,
                 exif_date TEXT,
@@ -120,6 +148,7 @@ class FotoroPipeline:
                 sha256 TEXT,
                 face_count INTEGER DEFAULT 0,
                 face_ids TEXT,
+                tag_confidence REAL DEFAULT 0.0,
                 processed INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -160,7 +189,7 @@ class FotoroPipeline:
         """)
         self.conn.commit()
 
-    # ─── FAISS ──────────────────────────────────────────────────────────
+    # --- FAISS ---------------------------------------------------------
 
     @staticmethod
     def _index_id_set(index: faiss.IndexIDMap2) -> Set[int]:
@@ -191,35 +220,19 @@ class FotoroPipeline:
         faiss.write_index(self.bge_index, str(self.bge_index_path))
         faiss.write_index(self.face_index, str(self.face_index_path))
 
-    # ─── Model Loading ────────────────────────────────────────────────
+    # --- Model Loading -------------------------------------------------
 
     def load_models(self, load_face: bool = True):
-        print("🔧 Loading models…")
+        print("Loading models...")
 
-        print("   → SigLIP base-patch16 (vision-text verifier)")
-        self.siglip_processor = AutoProcessor.from_pretrained(
-            "google/siglip-base-patch16-224", use_fast=True
-        )
-        self.siglip_model = AutoModel.from_pretrained(
-            "google/siglip-base-patch16-224"
-        ).to(self.device).eval()
-
-        print("   → BLIP-base (caption + tag generator)")
-        self.blip_processor = BlipProcessor.from_pretrained(
-            "Salesforce/blip-image-captioning-base"
-        )
-        self.blip_model = BlipForConditionalGeneration.from_pretrained(
-            "Salesforce/blip-image-captioning-base"
-        ).to(self.device).eval()
-
-        print("   → BGE-small-en-v1.5 (semantic encoder)")
-        self.bge_model = SentenceTransformer(
-            "BAAI/bge-small-en-v1.5", device=self.device
-        )
+        self._load_siglip()
+        self._load_blip()
+        self._load_bge()
+        self._precompute_tag_embeddings()
 
         if load_face:
             try:
-                print("   → InsightFace buffalo_l")
+                print("   -> InsightFace buffalo_l")
                 from insightface.app import FaceAnalysis
                 self.face_app = FaceAnalysis(
                     name="buffalo_l",
@@ -228,29 +241,266 @@ class FotoroPipeline:
                 )
                 self.face_app.prepare(ctx_id=0, det_size=(640, 640))
             except Exception as e:
-                print(f"    InsightFace skipped: {e}")
+                print(f"   WARNING: InsightFace skipped: {e}")
                 self.face_app = None
 
-        self._precompute_seed_tags()
-        print(f"   → Precomputed {len(ALL_SEED_TAGS)} seed tag embeddings")
-        print(" All models ready")
+        print("All models ready")
 
-    def _precompute_seed_tags(self):
-        batch_size = 16
-        embeddings = []
-        for i in range(0, len(ALL_SEED_TAGS), batch_size):
-            batch = ALL_SEED_TAGS[i:i + batch_size]
-            inputs = self.siglip_processor(
-                text=batch, return_tensors="pt", padding=True
-            ).to(self.device)
+    def _load_siglip(self):
+        print("   -> SigLIP PyTorch")
+        self.siglip_processor = AutoProcessor.from_pretrained(
+            "google/siglip-base-patch16-224", use_fast=True
+        )
+        self.siglip_model = AutoModel.from_pretrained(
+            "google/siglip-base-patch16-224"
+        ).to(self.device).eval()
+
+        onnx_path = self.dirs["models"] / "siglip_onnx"
+        if not onnx_path.exists():
+            return
+
+        try:
+            import onnxruntime as ort
+            sess_options = ort.SessionOptions()
+            sess_options.intra_op_num_threads = 2
+            sess_options.inter_op_num_threads = 1
+            session = ort.InferenceSession(
+                str(onnx_path / "model.onnx"),
+                sess_options,
+                providers=["CPUExecutionProvider"]
+            )
+
+            # Smoke test
+            test_img = Image.new("RGB", (224, 224), color=(128, 128, 128))
+            inputs = self.siglip_processor(images=test_img, return_tensors="pt")
+            pv = inputs["pixel_values"].cpu().numpy().astype(np.float32)
+            onnx_inputs = {inp.name: inp for inp in session.get_inputs()}
+            feed = {"pixel_values": pv}
+
+            # Handle dynamic shapes like 'sequence_length', 'batch_size'
+            def _resolve_dim(dim, default=64):
+                if isinstance(dim, int):
+                    return dim
+                if isinstance(dim, str):
+                    # Try to parse as int, fallback to default
+                    try:
+                        return int(dim)
+                    except ValueError:
+                        return default
+                return default
+
+            if "input_ids" in onnx_inputs:
+                inp = onnx_inputs["input_ids"]
+                seq_len = _resolve_dim(inp.shape[1] if len(inp.shape) > 1 else 64, 64)
+                feed["input_ids"] = np.zeros((1, seq_len), dtype=np.int64)
+            if "attention_mask" in onnx_inputs:
+                seq_len = feed.get("input_ids", np.zeros((1, 64))).shape[1]
+                feed["attention_mask"] = np.ones((1, seq_len), dtype=np.int64)
+
+            outputs = session.run(None, feed)
+            test_vec = outputs[0].squeeze()
+            test_vec = test_vec / (np.linalg.norm(test_vec) + 1e-8)
+
             with torch.inference_mode():
-                emb = self.siglip_model.get_text_features(**inputs)
-            emb = emb.cpu().numpy()
-            emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
-            embeddings.append(emb.astype(np.float32))
-        self.seed_tag_embeddings = np.vstack(embeddings)
+                pt_vec = self.siglip_model.get_image_features(**inputs).cpu().numpy().squeeze()
+            pt_vec = pt_vec / (np.linalg.norm(pt_vec) + 1e-8)
+            cos_sim = np.dot(test_vec, pt_vec)
 
-    # ─── Helpers ──────────────────────────────────────────────────────
+            if cos_sim >= 0.95 and test_vec.shape[0] == 768:
+                self._siglip_onnx_session = session
+                print(f"   -> SigLIP ONNX active (cos={cos_sim:.3f})")
+            else:
+                print(f"   -> ONNX mismatch (cos={cos_sim:.3f}), using PyTorch")
+        except Exception as e:
+            print(f"   -> ONNX failed: {e}")
+
+    def _load_blip(self):
+        print("   -> BLIP-base (slow path only)")
+        self.blip_processor = BlipProcessor.from_pretrained(
+            "Salesforce/blip-image-captioning-base"
+        )
+        self.blip_model = BlipForConditionalGeneration.from_pretrained(
+            "Salesforce/blip-image-captioning-base"
+        ).to(self.device).eval()
+
+    def _load_bge(self):
+        print("   -> BGE-small-en-v1.5")
+        self.bge_model = SentenceTransformer(
+            "BAAI/bge-small-en-v1.5", device=self.device
+        )
+
+    def _precompute_tag_embeddings(self):
+        print(f"   -> Precomputing {len(ALL_TAGS)} tag embeddings...")
+        batch_size = 32
+        embeddings = []
+        for i in range(0, len(ALL_TAGS), batch_size):
+            batch = ALL_TAGS[i:i + batch_size]
+            embs = []
+            for tag in batch:
+                inputs = self.siglip_processor(text=tag, return_tensors="pt").to(self.device)
+                with torch.inference_mode():
+                    feat = self.siglip_model.get_text_features(**inputs)
+                vec = feat.cpu().numpy().squeeze()
+                vec = vec / (np.linalg.norm(vec) + 1e-8)
+                embs.append(vec)
+            embeddings.extend(embs)
+        self._tag_embeddings = np.vstack(embeddings).astype(np.float32)
+        self._tag_list = ALL_TAGS
+        print(f"   -> Tag matrix: {self._tag_embeddings.shape}")
+
+    # --- FAST SigLIP Embedding -----------------------------------------
+
+    def _embed_siglip_image(self, image: Image.Image) -> np.ndarray:
+        if self._siglip_onnx_session:
+            inputs = self.siglip_processor(images=image, return_tensors="pt")
+            pv = inputs["pixel_values"].cpu().numpy().astype(np.float32)
+            onnx_inputs = {inp.name: inp for inp in self._siglip_onnx_session.get_inputs()}
+            feed = {"pixel_values": pv}
+
+            def _resolve_dim(dim, default=64):
+                if isinstance(dim, int):
+                    return dim
+                try:
+                    return int(dim)
+                except (ValueError, TypeError):
+                    return default
+
+            if "input_ids" in onnx_inputs:
+                inp = onnx_inputs["input_ids"]
+                seq_len = _resolve_dim(inp.shape[1] if len(inp.shape) > 1 else 64, 64)
+                feed["input_ids"] = np.zeros((pv.shape[0], seq_len), dtype=np.int64)
+            if "attention_mask" in onnx_inputs:
+                seq_len = feed.get("input_ids", np.zeros((pv.shape[0], 64))).shape[1]
+                feed["attention_mask"] = np.ones((pv.shape[0], seq_len), dtype=np.int64)
+
+            outputs = self._siglip_onnx_session.run(None, feed)
+            vec = outputs[0].squeeze()
+            return (vec / (np.linalg.norm(vec) + 1e-8)).astype(np.float32)
+        else:
+            inputs = self.siglip_processor(images=image, return_tensors="pt").to(self.device)
+            with torch.inference_mode():
+                feats = self.siglip_model.get_image_features(**inputs)
+            vec = feats.cpu().numpy().squeeze()
+            return (vec / (np.linalg.norm(vec) + 1e-8)).astype(np.float32)
+
+    def _embed_siglip_batch(self, images: List[Image.Image]) -> np.ndarray:
+        if self._siglip_onnx_session:
+            inputs = self.siglip_processor(images=images, return_tensors="pt")
+            pv = inputs["pixel_values"].cpu().numpy().astype(np.float32)
+            onnx_inputs = {inp.name: inp for inp in self._siglip_onnx_session.get_inputs()}
+            feed = {"pixel_values": pv}
+
+            def _resolve_dim(dim, default=64):
+                if isinstance(dim, int):
+                    return dim
+                try:
+                    return int(dim)
+                except (ValueError, TypeError):
+                    return default
+
+            if "input_ids" in onnx_inputs:
+                inp = onnx_inputs["input_ids"]
+                seq_len = _resolve_dim(inp.shape[1] if len(inp.shape) > 1 else 64, 64)
+                feed["input_ids"] = np.zeros((pv.shape[0], seq_len), dtype=np.int64)
+            if "attention_mask" in onnx_inputs:
+                seq_len = feed.get("input_ids", np.zeros((pv.shape[0], 64))).shape[1]
+                feed["attention_mask"] = np.ones((pv.shape[0], seq_len), dtype=np.int64)
+
+            outputs = self._siglip_onnx_session.run(None, feed)
+            vecs = outputs[0]
+            if vecs.ndim == 1:
+                vecs = vecs.reshape(1, -1)
+            norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-8
+            return (vecs / norms).astype(np.float32)
+        else:
+            inputs = self.siglip_processor(images=images, return_tensors="pt", padding=True).to(self.device)
+            with torch.inference_mode():
+                feats = self.siglip_model.get_image_features(**inputs)
+            vecs = feats.cpu().numpy()
+            norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-8
+            return (vecs / norms).astype(np.float32)
+
+    def _embed_siglip_text(self, text: str) -> np.ndarray:
+        inputs = self.siglip_processor(text=text, return_tensors="pt").to(self.device)
+        with torch.inference_mode():
+            feats = self.siglip_model.get_text_features(**inputs)
+        vec = feats.cpu().numpy().squeeze()
+        return (vec / (np.linalg.norm(vec) + 1e-8)).astype(np.float32)
+
+    # --- Zero-Shot Tag Classification (FAST) -------------------------
+
+    def _classify_tags_fast(self, image: Image.Image, top_k: int = 10, threshold: float = 0.30) -> Tuple[List[Dict], float]:
+        img_emb = self._embed_siglip_image(image)
+        sims = np.dot(self._tag_embeddings, img_emb)
+        top_idx = np.argsort(sims)[-top_k:][::-1]
+        tags = []
+        for idx in top_idx:
+            if sims[idx] >= threshold:
+                tags.append({"tag": self._tag_list[idx], "score": round(float(sims[idx]), 3)})
+        max_conf = float(sims.max()) if len(sims) > 0 else 0.0
+        return tags, max_conf
+
+    def _tags_to_caption(self, tags: List[Dict], colors: List[str]) -> str:
+        if not tags:
+            return "a photo"
+        top = [t["tag"] for t in tags[:5]]
+        parts = []
+        scenes = {"beach", "mountain", "city", "forest", "ocean", "desert", "garden", "park",
+                  "kitchen", "bedroom", "office", "restaurant", "street", "highway", "lake", "river"}
+        scene_tags = [t for t in top if t in scenes]
+        if scene_tags:
+            parts.append(scene_tags[0])
+        beings = [t for t in top if t in {"man", "woman", "child", "baby", "dog", "cat", "bird",
+                 "group of people", "couple", "family", "puppy", "kitten"}]
+        if beings:
+            parts.append("with " + beings[0])
+        acts = [t for t in top if t in {"eating", "running", "swimming", "driving", "selfie",
+               "walking", "playing music", "cooking", "reading", "dancing"}]
+        if acts:
+            parts.append(acts[0])
+        if colors:
+            parts.append(f"dominant {colors[0]} tones")
+        caption = ", ".join(parts) if len(parts) > 1 else (parts[0] if parts else "a photo")
+        return caption
+
+    # --- BLIP Slow Path ----------------------------------------------
+
+    def _caption_blip_batch(self, images: List[Image.Image]) -> List[str]:
+        inputs = self.blip_processor(images=images, return_tensors="pt").to(self.device)
+        with torch.inference_mode():
+            outputs = self.blip_model.generate(
+                **inputs,
+                max_length=20,
+                min_length=5,
+                num_beams=1,
+                do_sample=False,
+            )
+        return self.blip_processor.batch_decode(outputs, skip_special_tokens=True)
+
+    # --- BGE ---------------------------------------------------------
+
+    def _embed_bge_batch(self, texts: List[str]) -> np.ndarray:
+        texts = [t or "" for t in texts]
+        vecs = self.bge_model.encode(
+            texts, normalize_embeddings=True, convert_to_numpy=True,
+            batch_size=64, show_progress_bar=False
+        )
+        return vecs.astype(np.float32)
+
+    def _embed_bge(self, text: str) -> np.ndarray:
+        vec = self.bge_model.encode(text, normalize_embeddings=True, convert_to_numpy=True)
+        return vec.astype(np.float32)
+
+    # --- Helpers -----------------------------------------------------
+
+    @staticmethod
+    def _open_resized(path: Path, max_dim: int = 384) -> Image.Image:
+        img = Image.open(path).convert("RGB")
+        w, h = img.size
+        if max(w, h) > max_dim:
+            scale = max_dim / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+        return img
 
     @staticmethod
     def _is_screenshot(path: Path, image: Image.Image) -> bool:
@@ -298,25 +548,7 @@ class FotoroPipeline:
         return h.hexdigest()
 
     @staticmethod
-    def _rgb_to_name(r: int, g: int, b: int) -> str:
-        colors = {
-            "red": (255, 0, 0), "green": (0, 255, 0), "blue": (0, 0, 255),
-            "yellow": (255, 255, 0), "cyan": (0, 255, 255), "magenta": (255, 0, 255),
-            "white": (255, 255, 255), "black": (0, 0, 0), "gray": (128, 128, 128),
-            "orange": (255, 165, 0), "purple": (128, 0, 128), "pink": (255, 192, 203),
-            "brown": (165, 42, 42), "navy": (0, 0, 128), "teal": (0, 128, 128),
-            "lime": (50, 205, 50), "maroon": (128, 0, 0), "olive": (128, 128, 0),
-        }
-        min_dist = float("inf")
-        best = "unknown"
-        for name, (cr, cg, cb) in colors.items():
-            dist = (r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2
-            if dist < min_dist:
-                min_dist = dist
-                best = name
-        return best
-
-    def _extract_colors(self, image: Image.Image, n: int = 3) -> List[str]:
+    def _extract_colors(image: Image.Image, n: int = 3) -> List[str]:
         img = image.resize((30, 30)).convert("RGB")
         arr = np.array(img)
         arr = (arr // 51) * 51
@@ -326,7 +558,16 @@ class FotoroPipeline:
         colors = []
         for idx in top_idx:
             r, g, b = int(unique[idx][0]), int(unique[idx][1]), int(unique[idx][2])
-            colors.append(self._rgb_to_name(r, g, b))
+            if r > 200 and g < 100 and b < 100: colors.append("red")
+            elif r < 100 and g > 200 and b < 100: colors.append("green")
+            elif r < 100 and g < 100 and b > 200: colors.append("blue")
+            elif r > 200 and g > 200 and b < 100: colors.append("yellow")
+            elif r > 200 and g > 100 and b < 100: colors.append("orange")
+            elif r > 200 and g < 200 and b > 200: colors.append("pink")
+            elif r > 200 and g > 200 and b > 200: colors.append("white")
+            elif r < 50 and g < 50 and b < 50: colors.append("black")
+            elif r > 150 and g > 150 and b > 150: colors.append("gray")
+            else: colors.append("mixed")
         seen = set()
         out = []
         for c in colors:
@@ -335,160 +576,7 @@ class FotoroPipeline:
                 out.append(c)
         return out
 
-    # ─── DYNAMIC TAG EXTRACTION ───────────────────────────────────────
-
-    def _caption_to_candidate_tags(self, caption: str) -> List[str]:
-        """
-        Parse BLIP caption into candidate tags using linguistic patterns.
-        No hardcoded list — extracts anything that looks like a noun phrase.
-        """
-        caption_lower = caption.lower()
-        candidates = set()
-
-        # Pattern 1: "a [color] [noun]" → extract color+noun and noun
-        color_pattern = re.compile(
-            r'\b(red|blue|green|yellow|black|white|orange|pink|purple|gray|brown|navy)\s+(\w+)\b'
-        )
-        for color, noun in color_pattern.findall(caption_lower):
-            candidates.add(f"{color} {noun}")
-            candidates.add(noun)
-
-        # Pattern 2: "a [adj] [noun]" → extract noun
-        adj_noun = re.compile(r'\b(a|an|the)\s+(\w+)\s+(\w+)\b')
-        for _, adj, noun in adj_noun.findall(caption_lower):
-            if adj not in {"the", "a", "an", "of", "in", "on"}:
-                candidates.add(f"{adj} {noun}")
-            candidates.add(noun)
-
-        # Pattern 3: standalone nouns from caption (simple POS heuristic)
-        words = re.findall(r'\b[a-z]{3,}\b', caption_lower)
-        # Filter: keep words that are likely objects/scenes (ends in common noun suffixes)
-        noun_suffixes = ('ing', 'ion', 'ment', 'ness', 'ity', 'er', 'or', 'ist',
-                        'ism', 'ure', 'age', 'dom', 'hood', 'ship', 'ism')
-        for w in words:
-            if w.endswith(noun_suffixes) or w in {
-                'beach', 'mountain', 'ocean', 'forest', 'city', 'street', 'room',
-                'kitchen', 'bedroom', 'bathroom', 'office', 'car', 'dog', 'cat',
-                'person', 'people', 'man', 'woman', 'child', 'baby', 'group',
-                'wedding', 'party', 'concert', 'meeting', 'birthday', 'graduation',
-                'food', 'meal', 'dinner', 'lunch', 'breakfast', 'cake', 'pizza',
-                'phone', 'laptop', 'computer', 'book', 'cup', 'bottle', 'plate',
-                'shirt', 'pants', 'dress', 'jacket', 'hat', 'glasses', 'sunglasses',
-                'selfie', 'photo', 'picture', 'image', 'scene', 'view', 'landscape',
-            }:
-                candidates.add(w)
-
-        # Pattern 4: bigrams that appear in caption
-        bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words)-1)]
-        for bg in bigrams:
-            if any(bg.startswith(c + " ") for c in {
-                'red', 'blue', 'green', 'yellow', 'black', 'white', 'orange', 'pink'
-            }):
-                candidates.add(bg)
-
-        return list(candidates)
-
-    def _verify_tags_siglip(self, image: Image.Image, candidates: List[str], threshold: float = 0.48) -> List[Dict]:
-        """
-        Score each candidate tag against the image using SigLIP.
-        Returns: [{"tag": "beach", "score": 0.87}, ...]
-        """
-        if not candidates:
-            return []
-
-        # Deduplicate
-        candidates = list(dict.fromkeys(candidates))[:20]  # cap at 20 for speed
-
-        # Batch embed candidate texts
-        batch_size = 8
-        text_embs = []
-        for i in range(0, len(candidates), batch_size):
-            batch = candidates[i:i + batch_size]
-            inputs = self.siglip_processor(text=batch, return_tensors="pt", padding=True).to(self.device)
-            with torch.inference_mode():
-                emb = self.siglip_model.get_text_features(**inputs)
-            emb = emb.cpu().numpy()
-            emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
-            text_embs.append(emb.astype(np.float32))
-        text_embs = np.vstack(text_embs)  # (N_candidates, 768)
-
-        # Image embedding
-        img_emb = self._embed_siglip_image(image)  # (768,)
-
-        # Cosine similarities
-        sims = np.dot(text_embs, img_emb)  # (N_candidates,)
-
-        results = []
-        for tag, score in zip(candidates, sims):
-            if score >= threshold:
-                results.append({"tag": tag, "score": round(float(score), 3)})
-
-        # Sort by score descending
-        results.sort(key=lambda x: x["score"], reverse=True)
-        return results[:12]  # top 12
-
-    def _extract_tags(self, image: Image.Image, caption: str) -> List[Dict]:
-        """
-        Two-tier dynamic tagging:
-        1. BLIP caption → candidate tags (infinite vocabulary)
-        2. SigLIP verifies which candidates actually match the image
-        """
-        candidates = self._caption_to_candidate_tags(caption)
-        # Also add seed tags for coverage of things BLIP might miss
-        candidates.extend(ALL_SEED_TAGS)
-        return self._verify_tags_siglip(image, candidates)
-
-    # ─── Batch Embedding ──────────────────────────────────────────────
-
-    def _embed_siglip_batch(self, images: List[Image.Image]) -> np.ndarray:
-        inputs = self.siglip_processor(images=images, return_tensors="pt", padding=True).to(self.device)
-        with torch.inference_mode():
-            feats = self.siglip_model.get_image_features(**inputs)
-        vecs = feats.cpu().numpy()
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-8
-        return (vecs / norms).astype(np.float32)
-
-    def _embed_siglip_image(self, image: Image.Image) -> np.ndarray:
-        inputs = self.siglip_processor(images=image, return_tensors="pt").to(self.device)
-        with torch.inference_mode():
-            feats = self.siglip_model.get_image_features(**inputs)
-        vec = feats.cpu().numpy().squeeze()
-        return (vec / (np.linalg.norm(vec) + 1e-8)).astype(np.float32)
-
-    def _embed_siglip_text(self, text: str) -> np.ndarray:
-        inputs = self.siglip_processor(text=text, return_tensors="pt").to(self.device)
-        with torch.inference_mode():
-            feats = self.siglip_model.get_text_features(**inputs)
-        vec = feats.cpu().numpy().squeeze()
-        return (vec / (np.linalg.norm(vec) + 1e-8)).astype(np.float32)
-
-    def _embed_bge_batch(self, texts: List[str]) -> np.ndarray:
-        texts = [t or "" for t in texts]
-        vecs = self.bge_model.encode(
-            texts, normalize_embeddings=True, convert_to_numpy=True,
-            batch_size=32, show_progress_bar=False
-        )
-        return vecs.astype(np.float32)
-
-    def _embed_bge(self, text: str) -> np.ndarray:
-        vec = self.bge_model.encode(text, normalize_embeddings=True, convert_to_numpy=True)
-        return vec.astype(np.float32)
-
-    # ─── BLIP Batched Captioning ─────────────────────────────────────
-
-    def _caption_blip_batch(self, images: List[Image.Image]) -> List[str]:
-        inputs = self.blip_processor(images=images, return_tensors="pt").to(self.device)
-        with torch.inference_mode():
-            outputs = self.blip_model.generate(
-                **inputs,
-                max_length=60,
-                min_length=5,
-                num_beams=1,
-                do_sample=False,
-            )
-        return self.blip_processor.batch_decode(outputs, skip_special_tokens=True)
-
-    # ─── Face Detection ───────────────────────────────────────────────
+    # --- Face Detection ------------------------------------------------
 
     def _match_face_faiss(self, emb: np.ndarray, threshold: float = 0.60) -> Optional[int]:
         if self.face_index.ntotal == 0:
@@ -521,159 +609,12 @@ class FotoroPipeline:
                 np.array([person_id], dtype=np.int64)
             )
 
-    def _detect_faces(self, image: Image.Image, image_id: int, path: Path) -> Tuple[int, List[int]]:
-        if self.face_app is None:
-            return 0, []
-        if self._is_screenshot(path, image):
-            return 0, []
-
-        img_np = np.array(image.convert("RGB"))
-        h, w = img_np.shape[:2]
-        scale = 1.0
-        if max(h, w) > 1600:
-            scale = 1600 / max(h, w)
-            img_np = cv2.resize(img_np, (int(w * scale), int(h * scale)))
-
-        faces = self.face_app.get(img_np)
-        if not faces:
-            return 0, []
-
-        face_db_ids = []
-        for i, face in enumerate(faces):
-            bbox = face.bbox.astype(float)
-            face_w = bbox[2] - bbox[0]
-            face_h = bbox[3] - bbox[1]
-            face_area = face_w * face_h
-            img_area = img_np.shape[0] * img_np.shape[1]
-
-            if face_area / img_area < 0.0015:
-                continue
-            if hasattr(face, 'det_score') and face.det_score < 0.65:
-                continue
-            if hasattr(face, 'pose') and abs(face.pose[1]) > 45:
-                continue
-
-            if scale != 1.0:
-                bbox = (bbox / scale).astype(int)
-            else:
-                bbox = bbox.astype(int)
-
-            x1, y1, x2, y2 = max(0, int(bbox[0])), max(0, int(bbox[1])), int(bbox[2]), int(bbox[3])
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            margin_x = int((x2 - x1) * 0.15)
-            margin_y = int((y2 - y1) * 0.25)
-            cx1 = max(0, x1 - margin_x)
-            cy1 = max(0, y1 - margin_y)
-            cx2 = min(image.width, x2 + margin_x)
-            cy2 = min(image.height, y2 + margin_y)
-
-            crop = image.crop((cx1, cy1, cx2, cy2))
-            crop_path = self.dirs["face_crops"] / f"img{image_id}_face{i}.jpg"
-            crop.save(crop_path, quality=90)
-
-            emb = face.embedding.astype(np.float32)
-            emb_norm = emb / (np.linalg.norm(emb) + 1e-8)
-            emb_blob = emb.tobytes()
-
-            person_id = self._match_face_faiss(emb_norm, threshold=0.62)
-            if person_id is None:
-                person_id = self._match_face_faiss(emb_norm, threshold=0.55)
-
-            if person_id:
-                self._update_person_embedding(person_id, emb_norm)
-                self.conn.execute(
-                    "UPDATE persons SET photo_count = photo_count + 1 WHERE id = ?", (person_id,)
-                )
-            else:
-                cur = self.conn.execute(
-                    "INSERT INTO persons (face_embedding, sample_face_path, photo_count, name) VALUES (?, ?, 1, ?)",
-                    (emb_blob, str(crop_path), f"Person {self.face_index.ntotal + 1}")
-                )
-                person_id = cur.lastrowid
-                self.face_index.add_with_ids(
-                    emb_norm.reshape(1, -1),
-                    np.array([person_id], dtype=np.int64)
-                )
-                self._existing_face_ids.add(person_id)
-
-            face_db_ids.append(person_id)
-            self.conn.execute(
-                "INSERT INTO face_appearances (image_id, person_id, bbox, face_embedding, det_score, yaw) VALUES (?, ?, ?, ?, ?, ?)",
-                (image_id, person_id, json.dumps([int(x1), int(y1), int(x2), int(y2)]),
-                 emb_blob, float(getattr(face, 'det_score', 0.8)), float(getattr(face, 'pose', [0, 0, 0])[1]))
-            )
-
-        self.conn.commit()
-        return len(face_db_ids), face_db_ids
-
-    # ─── Album Post-Processing ────────────────────────────────────────
-
-    def merge_similar_persons(self, threshold: float = 0.72):
-        print(f"\n Merging similar albums (threshold {threshold})…")
-        persons = self.conn.execute(
-            "SELECT id, face_embedding FROM persons ORDER BY photo_count DESC"
-        ).fetchall()
-
-        merged = 0
-        for pid, emb_blob in persons:
-            if self.conn.execute("SELECT COUNT(*) FROM persons WHERE id=?", (pid,)).fetchone()[0] == 0:
-                continue
-
-            emb = np.frombuffer(emb_blob, dtype=np.float32)
-            emb = emb / (np.linalg.norm(emb) + 1e-8)
-
-            D, I = self.face_index.search(emb.reshape(1, -1), 5)
-            for sim_score, other_pid in zip(D[0], I[0]):
-                if other_pid < 0 or int(other_pid) == pid or sim_score < threshold:
-                    continue
-                other_pid = int(other_pid)
-
-                if self.conn.execute("SELECT COUNT(*) FROM persons WHERE id=?", (other_pid,)).fetchone()[0] == 0:
-                    continue
-
-                self.conn.execute("UPDATE face_appearances SET person_id=? WHERE person_id=?", (pid, other_pid))
-                other_count = self.conn.execute("SELECT photo_count FROM persons WHERE id=?", (other_pid,)).fetchone()[0]
-                self.conn.execute("UPDATE persons SET photo_count = photo_count + ? WHERE id=?", (other_count, pid))
-                self.conn.execute("DELETE FROM persons WHERE id=?", (other_pid,))
-                try:
-                    self.face_index.remove_ids(np.array([other_pid], dtype=np.int64))
-                except Exception:
-                    pass
-                self._existing_face_ids.discard(other_pid)
-                merged += 1
-                print(f"   Merged Person {other_pid} → Person {pid} (sim={sim_score:.3f})")
-
-        self.conn.commit()
-        self._save_indices()
-        print(f" Merged {merged} duplicates")
-
-    def cleanup_bad_crops(self, min_photos: int = 2):
-        rows = self.conn.execute(
-            "SELECT id FROM persons WHERE photo_count < ? AND name LIKE 'Person %'",
-            (min_photos,)
-        ).fetchall()
-        removed = 0
-        for (pid,) in rows:
-            self.conn.execute("DELETE FROM face_appearances WHERE person_id=?", (pid,))
-            self.conn.execute("DELETE FROM persons WHERE id=?", (pid,))
-            try:
-                self.face_index.remove_ids(np.array([pid], dtype=np.int64))
-            except Exception:
-                pass
-            self._existing_face_ids.discard(pid)
-            removed += 1
-        self.conn.commit()
-        self._save_indices()
-        print(f" Removed {removed} low-quality albums")
-
-    # ─── Ingestion ────────────────────────────────────────────────────
+    # --- INGESTION (v7.2) -------------------------------------------
 
     def ingest_folder(self, folder: str, recursive: bool = False):
         folder_path = Path(folder)
         if not folder_path.exists():
-            print(f" Folder not found: {folder}")
+            print(f"ERROR: Folder not found: {folder}")
             return
 
         exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
@@ -682,7 +623,7 @@ class FotoroPipeline:
             if f.suffix.lower() in exts
         ])
 
-        print(f" Phase 1/5: Discovery ({len(files)} files)")
+        print(f"Phase 1/4: Discovery ({len(files)} files)")
         new_entries = []
         skipped = 0
         for path in tqdm(files, desc="Metadata", unit="img", leave=False):
@@ -711,97 +652,133 @@ class FotoroPipeline:
 
         n = len(new_entries)
         if n == 0:
-            print(f" Nothing new. ({skipped} already in DB)")
+            print(f"Nothing new. ({skipped} already in DB)")
             return
 
-        print(f" {n} new | {skipped} skipped | Device: {self.device}\n")
+        print(f"{n} new | {skipped} skipped | Device: {self.device}")
 
-        needs_siglip = [(p, iid) for p, iid in new_entries if iid not in self._existing_siglip_ids]
-        needs_caption = []
+        needs_siglip = []
         needs_faces = []
-        for path, image_id in new_entries:
-            cap = self.conn.execute("SELECT caption FROM images WHERE id=?", (image_id,)).fetchone()[0]
-            if cap is None:
-                needs_caption.append((path, image_id))
-            fa = self.conn.execute("SELECT COUNT(*) FROM face_appearances WHERE image_id=?", (image_id,)).fetchone()[0]
+        for path, iid in new_entries:
+            if iid not in self._existing_siglip_ids:
+                needs_siglip.append((path, iid))
+            fa = self.conn.execute("SELECT COUNT(*) FROM face_appearances WHERE image_id=?", (iid,)).fetchone()[0]
             if fa == 0:
-                needs_faces.append((path, image_id))
+                needs_faces.append((path, iid))
 
-        # Phase 2: SigLIP visual
+        print(f"   -> {len(needs_siglip)} need SigLIP | {len(needs_faces)} need faces")
+
+        # Phase 2: SigLIP visual + zero-shot tags (batch 64, fused)
         if needs_siglip:
             t0 = time.time()
-            print(f" Phase 2/5: SigLIP visual ({len(needs_siglip)} images)")
-            batch_sz = 8
-            batch_imgs, batch_ids = [], []
-            for path, image_id in tqdm(needs_siglip, desc="SigLIP", unit="img", leave=False):
-                try:
-                    img = Image.open(path).convert("RGB")
-                    batch_imgs.append(img)
-                    batch_ids.append(image_id)
-                    if len(batch_imgs) == batch_sz:
-                        vecs = self._embed_siglip_batch(batch_imgs)
-                        self.siglip_index.add_with_ids(vecs, np.array(batch_ids, dtype=np.int64))
-                        for iid in batch_ids:
-                            self._existing_siglip_ids.add(iid)
-                        for im in batch_imgs:
-                            im.close()
-                        batch_imgs, batch_ids = [], []
-                except Exception as e:
-                    print(f"\n   SigLIP skip {path.name}: {e}")
+            print(f"Phase 2/4: SigLIP visual + tags ({len(needs_siglip)} images)")
+            sys.stdout.flush()
 
-            if batch_imgs:
-                vecs = self._embed_siglip_batch(batch_imgs)
-                self.siglip_index.add_with_ids(vecs, np.array(batch_ids, dtype=np.int64))
-                for iid in batch_ids:
-                    self._existing_siglip_ids.add(iid)
-                for im in batch_imgs:
-                    im.close()
-            self._save_indices()
-            print(f"    {time.time()-t0:.1f}s\n")
+            blip_queue = []  # (path, image_id, image, fast_tags, colors)
+            batch_sz = 64
+            n_batches = (len(needs_siglip) + batch_sz - 1) // batch_sz
 
-        # Phase 3: BLIP caption + dynamic tags + colors
-        if needs_caption:
-            t0 = time.time()
-            print(f" Phase 3/5: Caption + dynamic tags + colors ({len(needs_caption)} images)")
+            for batch_idx in tqdm(range(n_batches), desc="SigLIP batches", unit="batch"):
+                start = batch_idx * batch_sz
+                batch_items = needs_siglip[start:start + batch_sz]
+                loaded = []  # (path, iid, image)
 
-            def flush_blip_buffer(buf):
-                if not buf:
-                    return
-                imgs = [item[2] for item in buf]
-                captions = self._caption_blip_batch(imgs)
-                for (p, iid, im), cap in zip(buf, captions):
+                for path, iid in batch_items:
                     try:
-                        tags = self._extract_tags(im, cap)
-                        colors = self._extract_colors(im)
-                        self.conn.execute(
-                            "UPDATE images SET caption=?, tags=?, colors=? WHERE id=?",
-                            (cap, json.dumps(tags), json.dumps(colors), iid)
-                        )
+                        img = self._open_resized(path, max_dim=384)
+                        loaded.append((path, iid, img))
                     except Exception as e:
-                        print(f"\n    Tag fail {p.name}: {e}")
-                    finally:
-                        im.close()
+                        print(f"\n  Load fail {path.name}: {e}")
+                        sys.stdout.flush()
 
-            blip_buffer = []
-            for path, image_id in tqdm(needs_caption, desc="Caption", unit="img"):
+                if not loaded:
+                    continue
+
+                batch_t0 = time.time()
                 try:
-                    img = Image.open(path).convert("RGB")
-                    blip_buffer.append((path, image_id, img))
-                    if len(blip_buffer) == 4:
-                        flush_blip_buffer(blip_buffer)
-                        blip_buffer = []
-                except Exception as e:
-                    print(f"\n   Load fail {path.name}: {e}")
+                    images = [img for _, _, img in loaded]
+                    ids = [iid for _, iid, _ in loaded]
+                    vecs = self._embed_siglip_batch(images)
+                    self.siglip_index.add_with_ids(
+                        vecs, np.array(ids, dtype=np.int64)
+                    )
+                    for iid in ids:
+                        self._existing_siglip_ids.add(iid)
 
-            flush_blip_buffer(blip_buffer)
+                    # Classify tags per image
+                    for path, iid, img in loaded:
+                        try:
+                            tags, conf = self._classify_tags_fast(img, top_k=8, threshold=0.30)
+                            colors = self._extract_colors(img)
+                            is_screen = self._is_screenshot(path, img)
+
+                            if conf < 0.35 and not is_screen:
+                                blip_queue.append((path, iid, img, tags, colors))
+                            else:
+                                caption = self._tags_to_caption(tags, colors)
+                                self.conn.execute(
+                                    "UPDATE images SET caption=?, tags=?, colors=?, tag_confidence=? WHERE id=?",
+                                    (caption, json.dumps(tags), json.dumps(colors), conf, iid)
+                                )
+                                img.close()
+                        except Exception as e:
+                            print(f"\n  Tag fail {path.name}: {e}")
+                            sys.stdout.flush()
+                            img.close()
+
+                    batch_dt = time.time() - batch_t0
+                    per_img = batch_dt / len(loaded)
+                    if batch_idx % 5 == 0:
+                        print(f"\n  Batch {batch_idx+1}/{n_batches}: {len(loaded)} imgs in {batch_dt:.1f}s ({per_img:.2f}s/img)")
+                        sys.stdout.flush()
+
+                except Exception as e:
+                    print(f"\n  SigLIP batch fail: {e}")
+                    sys.stdout.flush()
+                    for _, _, img in loaded:
+                        img.close()
+
+            self._save_indices()
             self.conn.commit()
-            print(f"     {time.time()-t0:.1f}s\n")
+            gc.collect()
+            print(f"\nPhase 2 done: {time.time()-t0:.1f}s | {len(blip_queue)} need BLIP")
+            sys.stdout.flush()
+
+            # Phase 3: BLIP slow path
+            if blip_queue:
+                t0 = time.time()
+                print(f"Phase 3/4: BLIP slow path ({len(blip_queue)} images)")
+                blip_batch_sz = 32
+
+                for i in tqdm(range(0, len(blip_queue), blip_batch_sz), desc="BLIP batches", unit="batch"):
+                    batch = blip_queue[i:i + blip_batch_sz]
+                    imgs = [item[2] for item in batch]
+                    try:
+                        captions = self._caption_blip_batch(imgs)
+                        for (path, iid, img, fast_tags, colors), cap in zip(batch, captions):
+                            merged_tags = fast_tags + [{"tag": cap.lower(), "score": 0.5}]
+                            self.conn.execute(
+                                "UPDATE images SET caption=?, tags=?, colors=?, tag_confidence=? WHERE id=?",
+                                (cap, json.dumps(merged_tags), json.dumps(colors), 0.35, iid)
+                            )
+                    except Exception as e:
+                        print(f"\n  BLIP batch fail: {e}")
+                        sys.stdout.flush()
+                    finally:
+                        for _, _, img, _, _ in batch:
+                            img.close()
+
+                self.conn.commit()
+                gc.collect()
+                print(f"\nPhase 3 done: {time.time()-t0:.1f}s")
+            else:
+                print("Phase 3/4: BLIP (nothing needed)")
         else:
-            print(" Phase 3/5: Captioning (already done)\n")
+            print("Phase 2/4: SigLIP (already done)")
 
         # Phase 4: BGE text embedding
         t0 = time.time()
-        print(f" Phase 4/5: BGE text embedding")
+        print("Phase 4/4: BGE text embedding")
         all_rows = self.conn.execute(
             "SELECT id, caption, tags, colors, exif_date, ocr_text FROM images WHERE caption IS NOT NULL"
         ).fetchall()
@@ -815,22 +792,17 @@ class FotoroPipeline:
             tag_str = " ".join([t["tag"] for t in tags[:8]]) if tags else ""
             color_str = " ".join(colors[:3]) if colors else ""
             parts = []
-            if tag_str:
-                parts.append(f"Tags: {tag_str}.")
-            if color_str:
-                parts.append(f"Colors: {color_str}.")
-            if cap:
-                parts.append(cap)
-            if date:
-                parts.append(f"Date: {date}.")
-            if ocr:
-                parts.append(f"Text: {ocr}.")
+            if tag_str: parts.append(f"Tags: {tag_str}.")
+            if color_str: parts.append(f"Colors: {color_str}.")
+            if cap: parts.append(cap)
+            if date: parts.append(f"Date: {date}.")
+            if ocr: parts.append(f"Text: {ocr}.")
             synth = " ".join(parts)
             ids_list.append(img_id)
             synth_texts.append(synth)
 
         if synth_texts:
-            chunk = 32
+            chunk = 64
             for i in range(0, len(synth_texts), chunk):
                 c_chunk = synth_texts[i:i + chunk]
                 id_chunk = np.array(ids_list[i:i + chunk], dtype=np.int64)
@@ -839,40 +811,106 @@ class FotoroPipeline:
                 for iid in ids_list[i:i + chunk]:
                     self._existing_bge_ids.add(iid)
             self._save_indices()
-            print(f"   Indexed {len(synth_texts)} new in {time.time()-t0:.1f}s\n")
+            print(f"Indexed {len(synth_texts)} new in {time.time()-t0:.1f}s")
         else:
-            print(f"   Nothing new. ({time.time()-t0:.1f}s)\n")
+            print(f"Nothing new. ({time.time()-t0:.1f}s)")
 
-        # Phase 5: Faces
+        # Phase 5: Face detection
         if needs_faces and self.face_app:
             t0 = time.time()
-            print(f" Phase 5/5: Face detection ({len(needs_faces)} images)")
-            for path, image_id in tqdm(needs_faces, desc="Faces", unit="img"):
-                try:
-                    img = Image.open(path).convert("RGB")
-                    face_count, face_ids = self._detect_faces(img, image_id, path)
-                    img.close()
-                    if face_count:
-                        self.conn.execute(
-                            "UPDATE images SET face_count=?, face_ids=? WHERE id=?",
-                            (face_count, json.dumps([int(fid) for fid in face_ids]), image_id)
-                        )
-                except Exception as e:
-                    print(f"\n    Face fail {path.name}: {e}")
-            self.conn.commit()
-            self._save_indices()
-            print(f"     {time.time()-t0:.1f}s\n")
+            print("   -> Unloading main-process face model")
+            self.face_app = None
+            gc.collect()
+
+            person_tags = {"man", "woman", "child", "baby", "group of people", "couple",
+                          "family", "selfie", "portrait", "face", "person"}
+            face_candidates = []
+            for path, iid in needs_faces:
+                row = self.conn.execute("SELECT tags FROM images WHERE id=?", (iid,)).fetchone()
+                if row and row[0]:
+                    tags = json.loads(row[0])
+                    tag_names = {t["tag"] for t in tags}
+                    if tag_names & person_tags:
+                        face_candidates.append((path, iid))
+
+            n_face_workers = 1
+            print(f"Phase 5/5: Face detection ({len(face_candidates)}/{len(needs_faces)} images, {n_face_workers} worker)")
+            if face_candidates:
+                self._run_face_detection_parallel(face_candidates, n_face_workers)
+            gc.collect()
+            print(f"Time: {time.time()-t0:.1f}s")
         else:
-            print(" Phase 5/5: Faces (already done)\n")
+            print("Phase 5/5: Faces (already done)")
 
         img_count = self.conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
         person_count = self.conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
-        print(" Done")
+        print("Done")
         print(f"   Images:  {img_count}")
         print(f"   Persons: {person_count}")
         print(f"   Vectors: {self.siglip_index.ntotal} visual | {self.bge_index.ntotal} text | {self.face_index.ntotal} faces")
 
-    # ─── Query Engine ─────────────────────────────────────────────────
+    def _run_face_detection_parallel(self, needs_faces: List[Tuple[Path, int]], n_workers: int):
+        batch_size = max(1, len(needs_faces) // n_workers)
+        worker_batches = []
+        for i in range(0, len(needs_faces), batch_size):
+            worker_batches.append(needs_faces[i:i + batch_size])
+
+        all_detections = []
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(_detect_faces_worker, batch, str(self.dirs["models"]), str(self.dirs["face_crops"])): batch
+                for batch in worker_batches
+            }
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Face workers", unit="batch"):
+                try:
+                    batch_results = future.result()
+                    all_detections.extend(batch_results)
+                except Exception as e:
+                    print(f"Face worker failed: {e}")
+
+        for image_id, embeddings, bboxes, crop_paths in all_detections:
+            face_db_ids = []
+            for emb, bbox, crop_path in zip(embeddings, bboxes, crop_paths):
+                emb_norm = emb / (np.linalg.norm(emb) + 1e-8)
+                emb_blob = emb.astype(np.float32).tobytes()
+
+                person_id = self._match_face_faiss(emb_norm, threshold=0.62)
+                if person_id is None:
+                    person_id = self._match_face_faiss(emb_norm, threshold=0.55)
+
+                if person_id:
+                    self._update_person_embedding(person_id, emb_norm)
+                    self.conn.execute(
+                        "UPDATE persons SET photo_count = photo_count + 1 WHERE id = ?", (person_id,)
+                    )
+                else:
+                    cur = self.conn.execute(
+                        "INSERT INTO persons (face_embedding, sample_face_path, photo_count, name) VALUES (?, ?, 1, ?)",
+                        (emb_blob, crop_path, f"Person {self.face_index.ntotal + 1}")
+                    )
+                    person_id = cur.lastrowid
+                    self.face_index.add_with_ids(
+                        emb_norm.reshape(1, -1),
+                        np.array([person_id], dtype=np.int64)
+                    )
+                    self._existing_face_ids.add(person_id)
+
+                face_db_ids.append(person_id)
+                self.conn.execute(
+                    "INSERT INTO face_appearances (image_id, person_id, bbox, face_embedding) VALUES (?, ?, ?, ?)",
+                    (image_id, person_id, json.dumps([int(x) for x in bbox]), emb_blob)
+                )
+
+            if face_db_ids:
+                self.conn.execute(
+                    "UPDATE images SET face_count=?, face_ids=? WHERE id=?",
+                    (len(face_db_ids), json.dumps([int(fid) for fid in face_db_ids]), image_id)
+                )
+
+        self.conn.commit()
+        self._save_indices()
+
+    # --- Query Engine ------------------------------------------------
 
     @staticmethod
     def _expand_query(text: str) -> Tuple[List[str], Set[str]]:
@@ -912,7 +950,6 @@ class FotoroPipeline:
         for term in expanded_terms:
             if term in full:
                 score += 0.30
-        # Boost by tag confidence
         for t in tags:
             if t["tag"] in expanded_terms:
                 score += t["score"] * 0.5
@@ -929,8 +966,10 @@ class FotoroPipeline:
         return None
 
     def query(self, text: str, top_k: int = 10) -> List[Dict]:
-        if self.siglip_model is None or self.bge_model is None:
-            raise RuntimeError("Models not loaded. Call load_models() first.")
+        if self.siglip_model is None and self._siglip_onnx_session is None:
+            raise RuntimeError("SigLIP not loaded")
+        if self.bge_model is None:
+            raise RuntimeError("BGE not loaded")
 
         expanded_queries, expanded_terms = self._expand_query(text)
         face_pid = self._extract_face_filter(text)
@@ -942,7 +981,7 @@ class FotoroPipeline:
                 (face_pid,)
             ).fetchall()
             face_img_set = {r[0] for r in rows}
-            print(f"   👤 Filtering by person ID {face_pid} ({len(face_img_set)} photos)")
+            print(f"   Filtering by person ID {face_pid} ({len(face_img_set)} photos)")
 
         rrf_scores: Dict[int, float] = {}
 
@@ -974,7 +1013,7 @@ class FotoroPipeline:
             search_rrf(eq, weight=0.8)
 
         if not rrf_scores and face_img_set is not None:
-            print("    No vector matches with face filter; broadening…")
+            print("   No vector matches with face filter; broadening...")
             face_img_set = None
             search_rrf(expanded_queries[0], weight=1.5)
 
@@ -1026,12 +1065,12 @@ class FotoroPipeline:
                 })
         return results
 
-    # ─── Human-in-the-Loop ──────────────────────────────────────────
+    # --- Human-in-the-Loop -------------------------------------------
 
     def name_person(self, person_id: int, name: str):
         self.conn.execute("UPDATE persons SET name=? WHERE id=?", (name, person_id))
         self.conn.commit()
-        print(f"  Person {person_id} named '{name}'")
+        print(f"Person {person_id} named '{name}'")
 
     def correct_caption(self, image_id: int, new_caption: str):
         self.conn.execute("UPDATE images SET caption=? WHERE id=?", (new_caption, image_id))
@@ -1043,7 +1082,7 @@ class FotoroPipeline:
             pass
         self.bge_index.add_with_ids(vec, np.array([image_id], dtype=np.int64))
         self._save_indices()
-        print(f"  Caption updated & re-indexed for image {image_id}")
+        print(f"Caption updated & re-indexed for image {image_id}")
 
     def add_feedback(self, image_id: int, query: str, was_relevant: bool, notes: str = ""):
         self.conn.execute(
@@ -1051,9 +1090,9 @@ class FotoroPipeline:
             (image_id, query, 1 if was_relevant else 0, notes)
         )
         self.conn.commit()
-        print(f" Feedback recorded for image {image_id}")
+        print(f"Feedback recorded for image {image_id}")
 
-    # ─── Stats ────────────────────────────────────────────────────────
+    # --- Stats -------------------------------------------------------
 
     def stats(self):
         img_count = self.conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
@@ -1061,7 +1100,7 @@ class FotoroPipeline:
         face_total = self.conn.execute("SELECT COALESCE(SUM(face_count), 0) FROM images").fetchone()[0]
         feedback_count = self.conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
 
-        print(f"\n Fotoro Archive Stats")
+        print(f"Fotoro Archive Stats")
         print(f"   Images:      {img_count}")
         print(f"   Vectors:     {self.siglip_index.ntotal} visual | {self.bge_index.ntotal} text")
         print(f"   Persons:     {person_count} ({face_total} face appearances)")
@@ -1080,3 +1119,88 @@ class FotoroPipeline:
             (person_id,)
         ).fetchall()
         return [r[0] for r in rows]
+
+
+# --- Parallel Worker Function (module-level for pickle) ------------
+
+def _detect_faces_worker(batch: List[Tuple[Path, int]], models_root: str, face_crops_dir: str):
+    from insightface.app import FaceAnalysis
+    import numpy as np
+    from PIL import Image
+
+    face_crops_path = Path(face_crops_dir)
+    face_crops_path.mkdir(exist_ok=True)
+
+    app = FaceAnalysis(
+        name="buffalo_l",
+        root=models_root,
+        providers=["CPUExecutionProvider"]
+    )
+    app.prepare(ctx_id=0, det_size=(640, 640))
+
+    results = []
+    for path, image_id in batch:
+        image = None
+        try:
+            image = Image.open(path).convert("RGB")
+            w, h = image.size
+
+            name = path.name.lower()
+            is_screen = any(hint in name for hint in ["screenshot", "screencap", "snap", "screen_"]) or (max(w, h) / min(w, h) > 2.2)
+            if is_screen:
+                continue
+
+            if max(w, h) > 640:
+                scale = 640 / max(w, h)
+                image = image.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+
+            img_np = np.array(image)
+            faces = app.get(img_np)
+
+            embeddings = []
+            bboxes = []
+            crop_paths = []
+
+            for i, face in enumerate(faces):
+                bbox = face.bbox.astype(float)
+                face_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                img_area = img_np.shape[0] * img_np.shape[1]
+                if face_area / img_area < 0.002:
+                    continue
+                if hasattr(face, 'det_score') and face.det_score < 0.70:
+                    continue
+                if hasattr(face, 'pose') and abs(face.pose[1]) > 50:
+                    continue
+
+                bbox = bbox.astype(int)
+                x1, y1, x2, y2 = max(0, int(bbox[0])), max(0, int(bbox[1])), int(bbox[2]), int(bbox[3])
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                margin_x = int((x2 - x1) * 0.15)
+                margin_y = int((y2 - y1) * 0.25)
+                cx1 = max(0, x1 - margin_x)
+                cy1 = max(0, y1 - margin_y)
+                cx2 = min(image.width, x2 + margin_x)
+                cy2 = min(image.height, y2 + margin_y)
+
+                crop = image.crop((cx1, cy1, cx2, cy2))
+                crop_path = str(face_crops_path / f"img{image_id}_face{i}.jpg")
+                crop.save(crop_path, quality=85)
+
+                embeddings.append(face.embedding.astype(np.float32))
+                bboxes.append([int(x1), int(y1), int(x2), int(y2)])
+                crop_paths.append(crop_path)
+
+            if embeddings:
+                results.append((image_id, embeddings, bboxes, crop_paths))
+            else:
+                results.append((image_id, [], [], []))
+
+        except Exception:
+            results.append((image_id, [], [], []))
+        finally:
+            if image is not None:
+                image.close()
+
+    return results

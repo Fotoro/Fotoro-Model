@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fotoro Terminal Interface v4
+Fotoro Terminal Interface v4.1 — Crash‑resistant, results first
 """
 import argparse
 import sys
@@ -48,7 +48,7 @@ def main():
     fb.add_argument("--bad", action="store_true", help="Mark as irrelevant")
     fb.add_argument("--note", default="", help="Optional note")
 
-        # merge-albums
+    # merge-albums
     ma = subs.add_parser("merge-albums", help="Merge duplicate face albums")
     ma.add_argument("--threshold", type=float, default=0.72, help="Similarity threshold")
 
@@ -87,8 +87,10 @@ def main():
             if r['caption']:
                 cap = r['caption'][:160] + "…" if len(r['caption']) > 160 else r['caption']
                 print(f"    {cap}")
+            # FIX: tags are stored as dicts like {"tag": "beach", "score": 0.5}
             if r['tags']:
-                print(f"     {', '.join(r['tags'][:6])}")
+                tag_names = [t.get("tag", str(t)) for t in r['tags'][:6]]
+                print(f"     {', '.join(tag_names)}")
             if r['colors']:
                 print(f"     {', '.join(r['colors'])}")
             if args.show_ocr and r['ocr']:
@@ -103,6 +105,7 @@ def main():
             print()
 
     elif args.command == "stats":
+        # DB & FAISS indices are already loaded in __init__; no models needed
         pipe.stats()
 
     elif args.command == "persons":
@@ -129,12 +132,16 @@ def main():
         pipe.add_feedback(args.id, args.query, not args.bad, args.note)
 
     elif args.command == "merge-albums":
-        pipe.load_models(load_face=True)
-        pipe.merge_similar_persons(threshold=args.threshold)
+        print("merge-albums: not yet implemented in this pipeline version.")
+        # Uncomment once pipeline.py has merge_similar_persons():
+        # pipe.load_models(load_face=True)
+        # pipe.merge_similar_persons(threshold=args.threshold)
 
     elif args.command == "cleanup-albums":
-        pipe.load_models(load_face=True)
-        pipe.cleanup_bad_crops(min_photos=args.min_photos)
+        print("cleanup-albums: not yet implemented in this pipeline version.")
+        # Uncomment once pipeline.py has cleanup_bad_crops():
+        # pipe.load_models(load_face=True)
+        # pipe.cleanup_bad_crops(min_photos=args.min_photos)
 
     elif args.command == "rename-album":
         pipe.name_person(args.id, args.name)
