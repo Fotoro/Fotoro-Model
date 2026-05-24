@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fotoro</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand"><div class="logo">F</div><h1>Fotoro</h1></div>
+      <nav>
+        <button class="nav-item active" data-view="gallery"><span>🖼</span> Gallery</button>
+        <button class="nav-item" data-view="search"><span>🔍</span> Search</button>
+        <button class="nav-item" data-view="persons"><span>👥</span> People</button>
+        <button class="nav-item" data-view="ingest"><span>⬇</span> Import</button>
+        <button class="nav-item" data-view="stats"><span>📊</span> Stats</button>
+      </nav>
+      <div class="status" id="status">Ready</div>
+    </aside>
+
+    <main class="main">
+      <section id="view-gallery" class="view active">
+        <h2>Photos by Date</h2>
+        <div id="gallery-grid" class="gallery-root"></div>
+        <div id="gallery-sentinel" class="sentinel">Loading more…</div>
+      </section>
+
+      <section id="view-search" class="view">
+        <div class="search-hero">
+          <input type="text" id="search-input" placeholder="Describe what you want (e.g. red shirt beach)…" autocomplete="off">
+          <button id="search-btn" class="btn-primary">Search</button>
+        </div>
+        <div id="search-results" class="photo-grid"></div>
+      </section>
+
+      <section id="view-persons" class="view">
+        <h2>People</h2>
+        <div id="persons-grid" class="persons-grid"></div>
+      </section>
+
+      <section id="view-ingest" class="view">
+        <h2>Import Folder</h2>
+        <div class="panel">
+          <label>Absolute folder path</label>
+          <input type="text" id="ingest-path" placeholder="/home/user/Pictures">
+          <div class="checkboxes">
+            <label><input type="checkbox" id="ingest-recursive"> Recursive</label>
+            <label><input type="checkbox" id="ingest-no-faces"> Skip face detection</label>
+          </div>
+          <button id="ingest-btn" class="btn-primary">Start Import</button>
+          <div id="ingest-progress" class="progress-wrap hidden">
+            <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+            <div class="progress-text" id="progress-text">Waiting…</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-stats" class="view">
+        <h2>Archive Stats</h2>
+        <div id="stats-grid" class="stats-grid"></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modal" class="modal">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content">
+      <button class="modal-close">&times;</button>
+      <img id="modal-img" src="" alt="">
+      <div class="modal-meta">
+        <h3 id="modal-filename"></h3>
+        <p id="modal-caption"></p>
+        <div id="modal-tags" class="tags"></div>
+        <div class="modal-details" id="modal-details"></div>
+        <div class="modal-actions">
+          <button id="modal-feedback-good" class="btn-small">✓ Relevant</button>
+          <button id="modal-feedback-bad" class="btn-small">✗ Irrelevant</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
