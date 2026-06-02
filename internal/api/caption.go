@@ -11,27 +11,7 @@ import (
 
 const ServerURL = "http://localhost:8080/v1/chat/completions"
 
-const captionPrompt = `Classify and describe this image.
-
-RULES:
-1. Start with EXACTLY one label: PHOTO: or SCREENSHOT: or DOCUMENT: or NOTE:
-2. After the label, write 1-2 sentences ONLY.
-3. If people are visible: describe their clothing color and action.
-4. If NO people: describe the main object and setting.
-5. If you cannot see a detail clearly, do NOT mention it. Never guess.
-6. Do NOT transcribe text, numbers, or conversations.
-7. Do NOT invent brand names, locations, or emotions.
-
-EXAMPLES:
-PHOTO: A person wearing a red jacket and black pants stands in a grassy park holding a phone.
-SCREENSHOT: A mobile phone screen showing a messaging app with a green send button.
-DOCUMENT: A printed page with a bar graph and bullet points on white paper.
-NOTE: A handwritten page with blue ink and a small diagram in the corner.
-
-Now describe this image:`
-
-// 60 seconds, not 30. CPU under load needs time.
-var client = &http.Client{Timeout: 60 * time.Second}
+var client = &http.Client{Timeout: 30 * time.Second}
 
 type captionPayload struct {
 	Model    string `json:"model"`
@@ -55,17 +35,9 @@ type captionResponse struct {
 	} `json:"choices"`
 }
 
+// CaptionImage sends a JPEG to llama-server and returns the caption.
+// This is the ONLY function that talks to the vision model.
 func CaptionImage(jpegBytes []byte) (string, error) {
-	caption, err := captionOnce(jpegBytes)
-	if err != nil {
-		// Retry once after 2 seconds
-		time.Sleep(2 * time.Second)
-		caption, err = captionOnce(jpegBytes)
-	}
-	return caption, err
-}
-
-func captionOnce(jpegBytes []byte) (string, error) {
 	b64 := base64.StdEncoding.EncodeToString(jpegBytes)
 
 	payload := captionPayload{
@@ -91,13 +63,13 @@ func captionOnce(jpegBytes []byte) (string, error) {
 					},
 					{
 						Type: "text",
-						Text: captionPrompt,
+						Text: "Describe this image in detail. List: main subject, clothing colors, visible objects, setting, lighting. Be specific. Use exact color names. Write 2-4 sentences.",
 					},
 				},
 			},
 		},
 		Temperature: 0.2,
-		MaxTokens:   80, // Shorter = faster
+		MaxTokens:   100,
 	}
 
 	body, err := json.Marshal(payload)

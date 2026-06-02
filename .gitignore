@@ -35,8 +35,3 @@ Thumbs.db
 
 # HuggingFace cache
 .huggingface/
-
-# SQLite database
-*.db
-*.db-shm
-*.db-wal
