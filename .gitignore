@@ -18,11 +18,13 @@ person_albums/
 
 # User/private images
 images/
+images-test/
 
 # OS files
 .DS_Store
 Thumbs.db
 
+.cache/
 # IDE
 .vscode/
 .idea/
@@ -35,3 +37,9 @@ Thumbs.db
 
 # HuggingFace cache
 .huggingface/
+
+
+# database
+*.db
+*.db-shm
+*.db-wal
