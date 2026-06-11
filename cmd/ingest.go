@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,13 +67,25 @@ func RunIngest(dir, dbPath, model string) {
 		return
 	}
 
+	// OPTIMAL: 2 vision workers for 1 LLM worker
+	// Vision ~3s, LLM ~25s → 2 vision workers can prep ahead while LLM works
+	visionWorkers := 2
+	if w := os.Getenv("FOTORO_VISION_WORKERS"); w != "" {
+		if n, err := strconv.Atoi(w); err == nil && n > 0 {
+			visionWorkers = n
+		}
+	}
+	
+	llmWorkers := 1  // Confirmed: single worker = best latency
+	fmt.Printf("[INIT] Vision workers: %d | LLM workers: %d\n", visionWorkers, llmWorkers)
+
 	type visionResult struct {
 		path string
 		meta *validate.ImageMeta
 	}
 	type llmResult struct {
-		path    string
-		meta    *validate.ImageMeta
+		path     string
+		meta     *validate.ImageMeta
 		analysis ollama.Analysis
 	}
 
@@ -82,24 +93,16 @@ func RunIngest(dir, dbPath, model string) {
 	llmQ := make(chan visionResult, 100)
 	dbQ := make(chan llmResult, 100)
 
-	visionWorkers := runtime.NumCPU()
-	if w := os.Getenv("FOTORO_VISION_WORKERS"); w != "" {
-		if n, err := strconv.Atoi(w); err == nil && n > 0 {
-			visionWorkers = n
-		}
-	}
-
 	var processed, skipped, failed int64
 	start := time.Now()
 
-	// Stage 1: Vision prep workers
+	// Stage 1: Vision prep (2 workers, quiet logging)
 	var visionWg sync.WaitGroup
 	for i := 0; i < visionWorkers; i++ {
 		visionWg.Add(1)
 		go func(id int) {
 			defer visionWg.Done()
 			for path := range visionQ {
-				t0 := time.Now()
 				meta, err := validate.PrepareImage(path)
 				if err != nil {
 					atomic.AddInt64(&failed, 1)
@@ -109,13 +112,12 @@ func RunIngest(dir, dbPath, model string) {
 				if err := validate.SaveThumbnails(cacheDir, meta); err != nil {
 					fmt.Printf("[V%d] [WARN] %s: thumbs: %v\n", id, filepath.Base(path), err)
 				}
-				fmt.Printf("[V%d] [PREP] %s (%.0fms)\n", id, filepath.Base(path), time.Since(t0).Seconds()*1000)
 				llmQ <- visionResult{path: path, meta: meta}
 			}
 		}(i)
 	}
 
-	// Stage 2: Single LLM worker (model stays hot, KV cache warm)
+	// Stage 2: Single LLM worker (best latency)
 	var llmWg sync.WaitGroup
 	llmWg.Add(1)
 	go func() {
@@ -187,7 +189,7 @@ func RunIngest(dir, dbPath, model string) {
 	p := atomic.LoadInt64(&processed)
 	f := atomic.LoadInt64(&failed)
 	fmt.Printf("\n=== DONE ===\n")
-	fmt.Printf("Vision workers: %d | LLM workers: 1\n", visionWorkers)
+	fmt.Printf("Vision workers: %d | LLM workers: %d\n", visionWorkers, llmWorkers)
 	fmt.Printf("Processed: %d | Skipped: %d | Failed: %d\n", p, skipped, f)
 	if len(jobs) > 0 {
 		fmt.Printf("Total time: %.1f minutes (%.1f sec/image)\n",

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "=== Fotoro Speed Optimizer (3B Model) ==="
+echo "=== Fotoro Speed Optimizer (3B Model — SUB-25S TARGET) ==="
 
 # ── 1. CPU Governor ───────────────────────────────────────────────────────────
 echo "[KERNEL] Setting CPU governor to performance..."
@@ -45,7 +45,7 @@ export LLAMA_SERVER_BIN="$LLAMA_SERVER"
 export FOTORO_MODEL_PATH="${FOTORO_MODEL_PATH:-./models/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf}"
 export FOTORO_MMPROJ_PATH="${FOTORO_MMPROJ_PATH:-./models/mmproj-Qwen2.5-VL-3B-Instruct-Q8_0.gguf}"
 export LLAMA_THREADS="${LLAMA_THREADS:-$PHY_CORES}"
-export LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-2048}"
+export LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-512}"        # AGGRESSIVE: minimal ctx
 export LLAMA_FLASH_ATTN="${LLAMA_FLASH_ATTN:-1}"
 
 # ── 7. Fotoro Environment ─────────────────────────────────────────────────────
@@ -57,17 +57,20 @@ export EMBED_ADDR="${EMBED_ADDR:-http://127.0.0.1:8082}"
 # ── 8. Start embed server (if not running) ───────────────────────────────────
 if ! curl -s "$EMBED_ADDR/health" >/dev/null 2>&1; then
   echo "[EMBED] Starting embed server on $EMBED_ADDR..."
-  nohup "$LLAMA_SERVER"     -m ./models/nomic-embed-text-v1.5.f16.gguf     --host 127.0.0.1 --port 8082     --embeddings --mlock --no-mmap     >/tmp/fotoro-embed.log 2>&1 &
+  nohup "$LLAMA_SERVER"     -m ./models/nomic-embed-text-v1.5.f16.gguf     --host 127.0.0.1 --port 8082     --embeddings --no-mmap     >/tmp/fotoro-embed.log 2>&1 &
   sleep 3
 fi
 
 echo ""
-echo "=== Environment Ready (3B) ==="
+echo "=== Environment Ready (3B — SUB-25S) ==="
 echo "Physical cores: $PHY_CORES"
 echo "llama-server:   $LLAMA_SERVER"
 echo "VLM model:      $FOTORO_MODEL_PATH"
 echo "Embed model:    ./models/nomic-embed-text-v1.5.f16.gguf"
 echo "Embed server:   $EMBED_ADDR"
+echo "CTX size:       $LLAMA_CTX_SIZE (minimal for speed)"
+echo "Image tokens:   32-128 (aggressive, fast vision encoder)"
+echo "VLM input:      336px (balance of speed vs accuracy)"
 echo ""
 
 # ── 9. Build fotoro if not present ────────────────────────────────────────────

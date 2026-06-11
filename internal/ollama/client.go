@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const SystemPrompt = "You are a precise visual analyst. Describe personal photos accurately in 2-3 dense sentences. State the main event, setting, and specific details including people's clothing, facial expressions, and notable objects. Be direct. Do not start with 'The image shows' or 'In this picture'."
+const SystemPrompt = `You are a precise visual analyst. Describe images exactly as they appear. Be factual and specific. Never invent details.`
 
 type Client struct {
 	addr       string
@@ -34,6 +34,7 @@ type Analysis struct {
 	HasText     bool
 	HasFaces    bool
 	Orientation string
+	ImageType   string
 }
 
 func NewClient(baseURL, model string) *Client {
@@ -97,7 +98,7 @@ func (c *Client) startServer(modelPath, mmprojPath string) error {
 	}
 
 	threads := getEnv("LLAMA_THREADS", "4")
-	ctxSize := getEnv("LLAMA_CTX_SIZE", "2048")
+	ctxSize := getEnv("LLAMA_CTX_SIZE", "1024")
 
 	addr := strings.TrimPrefix(c.addr, "http://")
 	host := addr
@@ -114,18 +115,21 @@ func (c *Client) startServer(modelPath, mmprojPath string) error {
 		"--port", port,
 		"--threads", threads,
 		"--ctx-size", ctxSize,
-		"--batch-size", "1024",
-		"--ubatch-size", "1024",
+		"--batch-size", "512",
+		"--ubatch-size", "512",
 		"--cache-type-k", "q8_0",
 		"--cache-type-v", "q8_0",
-		"--mlock",
+		"--image-min-tokens", "64",
+		"--image-max-tokens", "256",
 		"--no-mmap",
-		"--cache-prompt",
-		"--image-min-tokens", "128",
-		"--image-max-tokens", "512",
 	}
+
+	if os.Getenv("LLAMA_MLOCK") == "1" {
+		args = append(args, "--mlock")
+	}
+
 	if os.Getenv("LLAMA_FLASH_ATTN") == "1" {
-		args = append(args, "--flash-attn", "on")
+		args = append(args, "--flash-attn")
 	}
 
 	c.serverCmd = exec.Command(exe, args...)
@@ -133,7 +137,7 @@ func (c *Client) startServer(modelPath, mmprojPath string) error {
 	c.serverCmd.Stderr = os.Stderr
 	c.serverCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	fmt.Printf("[LLM] Starting llama-server (3B): %s %v\\n", exe, args)
+	fmt.Printf("[LLM] Starting llama-server (3B CPU-optimized): %s %v\n", exe, args)
 	if err := c.serverCmd.Start(); err != nil {
 		return fmt.Errorf("start llama-server: %w", err)
 	}
@@ -178,13 +182,29 @@ func (c *Client) VerifyModel() error {
 	return c.lazyStart()
 }
 
-// ORIGINAL sampling params that produced good captions
 func (c *Client) AnalyzeImage(vlmBytes []byte) (Analysis, error) {
 	if err := c.lazyStart(); err != nil {
 		return Analysis{}, err
 	}
 
 	b64 := base64.StdEncoding.EncodeToString(vlmBytes)
+
+	// SPEED OPTIMIZED PROMPT:
+	// - No type classification in output (saves ~5-10s)
+	// - Direct description only
+	// - Very strict length limit
+	// - Lower temp for less wandering
+	userPrompt := `Describe this image in 2 concise sentences. Be specific and factual.
+
+Rules:
+- Start directly with the subject. NEVER say "The image shows" or "This is a photo of"
+- For screenshots: describe the app, visible text, UI elements
+- For documents: transcribe key text, describe layout
+- For wallpapers: describe colors, pattern, subject, style
+- For photos: describe people, clothing, setting, objects, action, event
+- For artwork: describe style, subject, colors, medium
+- NEVER invent details. If unclear, describe what you can see.
+- Be dense and specific.`
 
 	reqBody := map[string]interface{}{
 		"model": c.model,
@@ -204,15 +224,14 @@ func (c *Client) AnalyzeImage(vlmBytes []byte) (Analysis, error) {
 					},
 					{
 						"type": "text",
-						"text": "Describe this photo concisely.",
+						"text": userPrompt,
 					},
 				},
 			},
 		},
-		"max_tokens":  128,
-		"temperature": 0.2,
-		"stop":        []string{"USER:", "ASSISTANT:", "</s>", "|im_end|"},
-		"cache_prompt": true,
+		"max_tokens":  96,        // STRICT: ~50 words max
+		"temperature": 0.05,      // NEAR-DETERMINISTIC: barely any creativity
+		"stop":        []string{"USER:", "ASSISTANT:", "</s>", "|im_end|", "\n"},
 	}
 
 	body, _ := json.Marshal(reqBody)
@@ -238,17 +257,8 @@ func (c *Client) AnalyzeImage(vlmBytes []byte) (Analysis, error) {
 
 	raw := result.Choices[0].Message.Content
 	analysis := parseAnalysis(raw)
-	analysis.Caption = addPrefix(analysis.Caption, analysis.Category)
-	
-	return analysis, nil
-}
 
-// Binary prefix: Photo vs Document only
-func addPrefix(caption, category string) string {
-	if category == "documents" {
-		return "Document: " + caption
-	}
-	return "Photo: " + caption
+	return analysis, nil
 }
 
 func (c *Client) GetEmbedding(text string) ([]float32, error) {
@@ -259,34 +269,78 @@ func (c *Client) ExpandQuery(q string) string {
 	return q
 }
 
-// Binary classification: photo vs document
 func parseAnalysis(raw string) Analysis {
-	a := Analysis{Category: "photo", Orientation: "landscape"}
-	lines := strings.Split(raw, "\\n")
-	if len(lines) > 0 {
-		a.Caption = strings.TrimSpace(lines[0])
-	}
-	lower := strings.ToLower(raw)
+	a := Analysis{Category: "unknown", Orientation: "landscape", ImageType: "photo"}
 
+	// Clean up the raw caption
+	raw = strings.TrimSpace(raw)
+
+	// Remove common prefixes the model might still generate despite instructions
+	prefixes := []string{
+		"the image shows ", "this is a photo of ", "this image depicts ",
+		"the photo shows ", "this is a screenshot of ", "this is a picture of ",
+		"the image is ", "this image is ", "the photo is ", "this photo is ",
+	}
+	lowerRaw := strings.ToLower(raw)
+	for _, p := range prefixes {
+		if strings.HasPrefix(lowerRaw, p) {
+			raw = raw[len(p):]
+			break
+		}
+	}
+
+	// Capitalize first letter
+	if len(raw) > 0 {
+		raw = strings.ToUpper(raw[:1]) + raw[1:]
+	}
+
+	a.Caption = raw
+
+	lower := strings.ToLower(a.Caption)
+
+	// Detect category from caption content (internal only, not in output)
 	switch {
-	case strings.Contains(lower, "document") || strings.Contains(lower, "text") ||
-		 strings.Contains(lower, "receipt") || strings.Contains(lower, "paper") ||
-		 strings.Contains(lower, "handwriting") || strings.Contains(lower, "handwritten") ||
-		 strings.Contains(lower, "notes") || strings.Contains(lower, "notebook") ||
-		 strings.Contains(lower, "letter") || strings.Contains(lower, "form") ||
-		 strings.Contains(lower, "invoice") || strings.Contains(lower, "bill") ||
-		 strings.Contains(lower, "page") || strings.Contains(lower, "writing") ||
-		 strings.Contains(lower, "printed") || strings.Contains(lower, "sign") ||
-		 strings.Contains(lower, "label") || strings.Contains(lower, "ticket") ||
-		 strings.Contains(lower, "certificate") || strings.Contains(lower, "contract") ||
-		 strings.Contains(lower, "menu") || strings.Contains(lower, "receipt"):
+	case strings.Contains(lower, "screenshot") || strings.Contains(lower, "screen") || strings.Contains(lower, "interface") || strings.Contains(lower, "app ") || strings.Contains(lower, "whatsapp") || strings.Contains(lower, "chat") || strings.Contains(lower, "conversation"):
+		a.ImageType = "screenshot"
+		a.Category = "screenshots"
+	case strings.Contains(lower, "document") || strings.Contains(lower, "receipt") || strings.Contains(lower, "paper") || strings.Contains(lower, "invoice") || strings.Contains(lower, "text") || strings.Contains(lower, "form") || strings.Contains(lower, "page"):
+		a.ImageType = "document"
 		a.Category = "documents"
 		a.HasText = true
+	case strings.Contains(lower, "meme"):
+		a.ImageType = "meme"
+		a.Category = "memes"
+	case strings.Contains(lower, "artwork") || strings.Contains(lower, "painting") || strings.Contains(lower, "digital art") || strings.Contains(lower, "illustration"):
+		a.ImageType = "artwork"
+		a.Category = "art"
+	case strings.Contains(lower, "icon") || strings.Contains(lower, "logo"):
+		a.ImageType = "icon"
+		a.Category = "icons"
+	case strings.Contains(lower, "wallpaper") || strings.Contains(lower, "pattern") || strings.Contains(lower, "abstract") || strings.Contains(lower, "gradient") || strings.Contains(lower, "texture"):
+		a.ImageType = "wallpaper"
+		a.Category = "wallpapers"
+	case strings.Contains(lower, "person") || strings.Contains(lower, "face") || strings.Contains(lower, "portrait") || strings.Contains(lower, "man") || strings.Contains(lower, "woman") || strings.Contains(lower, "people") || strings.Contains(lower, "child") || strings.Contains(lower, "group"):
+		a.ImageType = "photo"
+		a.Category = "people"
+		a.HasFaces = true
+	case strings.Contains(lower, "landscape") || strings.Contains(lower, "mountain") || strings.Contains(lower, "beach") || strings.Contains(lower, "nature") || strings.Contains(lower, "sky") || strings.Contains(lower, "forest") || strings.Contains(lower, "ocean") || strings.Contains(lower, "sunset"):
+		a.ImageType = "photo"
+		a.Category = "landscape"
+	case strings.Contains(lower, "building") || strings.Contains(lower, "architecture") || strings.Contains(lower, "house") || strings.Contains(lower, "city") || strings.Contains(lower, "street"):
+		a.ImageType = "photo"
+		a.Category = "architecture"
+	case strings.Contains(lower, "animal") || strings.Contains(lower, "dog") || strings.Contains(lower, "cat") || strings.Contains(lower, "bird") || strings.Contains(lower, "pet"):
+		a.ImageType = "photo"
+		a.Category = "animals"
+	case strings.Contains(lower, "food") || strings.Contains(lower, "meal") || strings.Contains(lower, "dish") || strings.Contains(lower, "cuisine") || strings.Contains(lower, "restaurant"):
+		a.ImageType = "photo"
+		a.Category = "food"
 	default:
-		a.Category = "photo"
+		a.ImageType = "photo"
 	}
 
-	re := regexp.MustCompile(`\\b\\w{4,}\\b`)
+	// Extract tags
+	re := regexp.MustCompile(`\b\w{4,}\b`)
 	words := re.FindAllString(lower, -1)
 	seen := make(map[string]bool)
 	for _, w := range words {
@@ -303,7 +357,13 @@ func parseAnalysis(raw string) Analysis {
 func isStopWord(w string) bool {
 	switch w {
 	case "the", "and", "this", "that", "with", "from", "image", "photo", "picture",
-		 "shows", "showing", "depicts", "features", "displays":
+		 "shows", "showing", "depicts", "features", "displays", "appears", "seems",
+		 "looks", "like", "about", "some", "very", "also", "have", "been", "there",
+		 "their", "they", "them", "than", "then", "when", "where", "what", "which",
+		 "who", "will", "would", "could", "should", "may", "might", "must", "can",
+		 "into", "over", "under", "above", "below", "between", "through", "during",
+		 "before", "after", "while", "because", "since", "until", "although",
+		 "however", "therefore", "furthermore", "moreover", "nevertheless":
 		return true
 	}
 	return false
