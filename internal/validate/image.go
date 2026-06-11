@@ -12,10 +12,10 @@ import (
 )
 
 const (
-	VLMSize     = 448
+	VLMSize     = 224
 	ThumbSmall  = 256
 	ThumbMedium = 1024
-	MaxFileSize = 50 * 1024 * 1024 // 50MB
+	MaxFileSize = 50 * 1024 * 1024
 )
 
 type ImageMeta struct {
@@ -56,7 +56,6 @@ func PrepareImage(path string) (*ImageMeta, error) {
 		return nil, err
 	}
 
-	// FIX: AutoOrientation is a DecodeOption, passed to Open
 	img, err := imaging.Open(path, imaging.AutoOrientation(true))
 	if err != nil {
 		return nil, fmt.Errorf("open image: %w", err)
@@ -67,27 +66,24 @@ func PrepareImage(path string) (*ImageMeta, error) {
 		return nil, fmt.Errorf("suspicious dimensions: %dx%d", w, h)
 	}
 
-	// VLM input
 	vlmImg := img
 	if w > VLMSize || h > VLMSize {
-		vlmImg = imaging.Fit(img, VLMSize, VLMSize, imaging.Lanczos)
+		vlmImg = imaging.Fit(img, VLMSize, VLMSize, imaging.Box)
 	}
 	var vlmBuf bytes.Buffer
-	if err := imaging.Encode(&vlmBuf, vlmImg, imaging.JPEG, imaging.JPEGQuality(90)); err != nil {
+	if err := imaging.Encode(&vlmBuf, vlmImg, imaging.JPEG, imaging.JPEGQuality(80)); err != nil {
 		return nil, err
 	}
 
-	// Small thumb
 	smallImg := imaging.Fit(img, ThumbSmall, ThumbSmall, imaging.Box)
 	var smallBuf bytes.Buffer
-	if err := imaging.Encode(&smallBuf, smallImg, imaging.JPEG, imaging.JPEGQuality(80)); err != nil {
+	if err := imaging.Encode(&smallBuf, smallImg, imaging.JPEG, imaging.JPEGQuality(75)); err != nil {
 		return nil, err
 	}
 
-	// Medium thumb
 	medImg := imaging.Fit(img, ThumbMedium, ThumbMedium, imaging.Lanczos)
 	var medBuf bytes.Buffer
-	if err := imaging.Encode(&medBuf, medImg, imaging.JPEG, imaging.JPEGQuality(85)); err != nil {
+	if err := imaging.Encode(&medBuf, medImg, imaging.JPEG, imaging.JPEGQuality(80)); err != nil {
 		return nil, err
 	}
 

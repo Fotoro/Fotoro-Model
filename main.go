@@ -9,7 +9,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: fotoro [ingest|daemon|server]")
+		fmt.Println("Usage: fotoro [ingest|daemon|server|app|backfill]")
 		os.Exit(1)
 	}
 
@@ -19,7 +19,7 @@ func main() {
 	}
 	model := os.Getenv("FOTORO_MODEL")
 	if model == "" {
-		model = "qwen2.5-vl-3b-fotoro"
+		model = "llava-phi3"
 	}
 
 	switch os.Args[1] {
@@ -41,6 +41,10 @@ func main() {
 			addr = ":8080"
 		}
 		cmd.RunServer(addr, dbPath, model)
+	case "app":
+		cmd.RunApp(dbPath, model)
+	case "backfill":
+		cmd.RunBackfill(dbPath, model)
 	default:
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
 		os.Exit(1)

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"fotoro/internal/db"
@@ -23,20 +24,11 @@ func RunIngest(dir, dbPath, model string) {
 	}
 	defer database.Close()
 
-	fmt.Println("[INIT] Connecting to Ollama...")
-	client := ollama.NewClient("http://localhost:11434", model)
+	fmt.Println("[INIT] Starting inference backend...")
+	client := ollama.NewClient("", model)
 	if err := client.HealthCheck(); err != nil {
-		fmt.Fprintf(os.Stderr, "Ollama not running. Start it first: %v\n", err)
-		os.Exit(1)
+		fmt.Printf("[INIT] Backend will start on first request (%v)\n", err)
 	}
-	fmt.Println("[INIT] Ollama is healthy")
-
-	fmt.Println("[INIT] Checking model...")
-	if err := client.VerifyModel(); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("[INIT] Model '%s' found\n", model)
 
 	files := collectImages(dir)
 	fmt.Printf("[INIT] Found %d image files\n", len(files))
@@ -55,112 +47,151 @@ func RunIngest(dir, dbPath, model string) {
 
 	cacheDir := filepath.Join(filepath.Dir(dbPath), ".cache")
 
-	workers := runtime.NumCPU()
-	if w := os.Getenv("FOTORO_WORKERS"); w != "" {
+	var jobs []string
+	for _, path := range files {
+		hash, err := validate.FastHash(path)
+		if err != nil {
+			fmt.Printf("[PRE] [SKIP] %s: hash error: %v\n", filepath.Base(path), err)
+			continue
+		}
+		if _, ok := existing[hash]; ok {
+			fmt.Printf("[PRE] [SKIP] %s: duplicate\n", filepath.Base(path))
+			continue
+		}
+		existing[hash] = struct{}{}
+		jobs = append(jobs, path)
+	}
+	fmt.Printf("[INIT] %d new images to process\n", len(jobs))
+
+	if len(jobs) == 0 {
+		fmt.Println("[INIT] Nothing to do.")
+		return
+	}
+
+	type visionResult struct {
+		path string
+		meta *validate.ImageMeta
+	}
+	type llmResult struct {
+		path    string
+		meta    *validate.ImageMeta
+		analysis ollama.Analysis
+	}
+
+	visionQ := make(chan string, len(jobs))
+	llmQ := make(chan visionResult, 100)
+	dbQ := make(chan llmResult, 100)
+
+	visionWorkers := runtime.NumCPU()
+	if w := os.Getenv("FOTORO_VISION_WORKERS"); w != "" {
 		if n, err := strconv.Atoi(w); err == nil && n > 0 {
-			workers = n
+			visionWorkers = n
 		}
 	}
-	fmt.Printf("[INIT] Starting %d workers\n", workers)
 
-	var mu sync.Mutex
-	processed, skipped, failed := 0, 0, 0
+	var processed, skipped, failed int64
 	start := time.Now()
 
-	jobs := make(chan string, len(files))
-	var wg sync.WaitGroup
-
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
+	// Stage 1: Vision prep workers
+	var visionWg sync.WaitGroup
+	for i := 0; i < visionWorkers; i++ {
+		visionWg.Add(1)
 		go func(id int) {
-			defer wg.Done()
-			for path := range jobs {
-
-				hash, err := validate.FastHash(path)
-				if err != nil {
-					mu.Lock()
-					failed++
-					mu.Unlock()
-					fmt.Printf("[W%d] [SKIP] %s: hash error: %v\n", id, filepath.Base(path), err)
-					continue
-				}
-
-				mu.Lock()
-				if _, ok := existing[hash]; ok {
-					skipped++
-					mu.Unlock()
-					fmt.Printf("[W%d] [SKIP] %s: duplicate\n", id, filepath.Base(path))
-					continue
-				}
-				existing[hash] = struct{}{}
-				mu.Unlock()
-
+			defer visionWg.Done()
+			for path := range visionQ {
+				t0 := time.Now()
 				meta, err := validate.PrepareImage(path)
 				if err != nil {
-					mu.Lock()
-					failed++
-					mu.Unlock()
-					fmt.Printf("[W%d] [SKIP] %s: prep error: %v\n", id, filepath.Base(path), err)
+					atomic.AddInt64(&failed, 1)
+					fmt.Printf("[V%d] [SKIP] %s: prep error: %v\n", id, filepath.Base(path), err)
 					continue
 				}
-				_ = validate.SaveThumbnails(cacheDir, meta)
-
-				fmt.Printf("[W%d] → %s: Ollama...\n", id, filepath.Base(path))
-				analysis, err := client.AnalyzeImage(meta.VLMBytes)
-				if err != nil {
-					mu.Lock()
-					failed++
-					mu.Unlock()
-					fmt.Printf("[W%d] [FAIL] %s: %v\n", id, filepath.Base(path), err)
-					database.Exec(
-						"INSERT OR IGNORE INTO images (path, hash, caption, category, tier) VALUES (?, ?, ?, ?, ?)",
-						meta.Path, meta.Hash, "", "failed", "bulk",
-					)
-					continue
+				if err := validate.SaveThumbnails(cacheDir, meta); err != nil {
+					fmt.Printf("[V%d] [WARN] %s: thumbs: %v\n", id, filepath.Base(path), err)
 				}
-
-				
-
-				// We don't care about tags anymore, hardcode the defaults for the unused columns
-				_, err = database.Exec(
-					`INSERT INTO images (path, hash, caption, category, tags, has_text, has_faces, orientation, tier, processed_at)
-					 VALUES (?, ?, ?, 'unknown', '', 0, 0, 'unknown', 'bulk', ?)`,
-					meta.Path, meta.Hash, analysis.Caption, time.Now(),
-				)
-				if err != nil {
-					mu.Lock()
-					failed++
-					mu.Unlock()
-					fmt.Printf("[W%d] [FAIL] %s: DB error: %v\n", id, filepath.Base(path), err)
-					continue
-				}
-
-				mu.Lock()
-				processed++
-				total := processed + skipped + failed
-				elapsed := time.Since(start).Seconds()
-				rate := float64(total) / elapsed
-				mu.Unlock()
-
-				// Simplified progress print
-				fmt.Printf("[W%d] [OK] %s | %.70s\n", id, filepath.Base(path), analysis.Caption)
-				fmt.Printf("  Progress: %d OK, %d skip, %d fail | %.2f img/s | elapsed: %.0fs\n",
-					processed, skipped, failed, rate, elapsed)
+				fmt.Printf("[V%d] [PREP] %s (%.0fms)\n", id, filepath.Base(path), time.Since(t0).Seconds()*1000)
+				llmQ <- visionResult{path: path, meta: meta}
 			}
 		}(i)
 	}
 
-	for _, path := range files {
-		jobs <- path
+	// Stage 2: Single LLM worker (model stays hot, KV cache warm)
+	var llmWg sync.WaitGroup
+	llmWg.Add(1)
+	go func() {
+		defer llmWg.Done()
+		for res := range llmQ {
+			t0 := time.Now()
+			analysis, err := client.AnalyzeImage(res.meta.VLMBytes)
+			if err != nil {
+				atomic.AddInt64(&failed, 1)
+				fmt.Printf("[LLM] [FAIL] %s: %v\n", filepath.Base(res.path), err)
+				database.Exec(
+					"INSERT OR IGNORE INTO images (path, hash, caption, category, tier) VALUES (?, ?, ?, ?, ?)",
+					res.meta.Path, res.meta.Hash, "", "failed", "bulk",
+				)
+				continue
+			}
+
+			fmt.Printf("[LLM] [OK] %s | %.70s (%.1fs)\n",
+				filepath.Base(res.path), analysis.Caption, time.Since(t0).Seconds())
+			dbQ <- llmResult{path: res.path, meta: res.meta, analysis: analysis}
+		}
+	}()
+
+	// Stage 3: DB writer
+	var dbWg sync.WaitGroup
+	dbWg.Add(1)
+	go func() {
+		defer dbWg.Done()
+		for res := range dbQ {
+			tags := ""
+			if len(res.analysis.Tags) > 0 {
+				tags = strings.Join(res.analysis.Tags, " ")
+			}
+			_, err := database.Exec(
+				`INSERT INTO images (path, hash, caption, category, tags, has_text, has_faces, orientation, tier, processed_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				res.meta.Path, res.meta.Hash, res.analysis.Caption, res.analysis.Category,
+				tags, boolToInt(res.analysis.HasText), boolToInt(res.analysis.HasFaces),
+				res.analysis.Orientation, "bulk", time.Now(),
+			)
+			if err != nil {
+				atomic.AddInt64(&failed, 1)
+				fmt.Printf("[DB] [FAIL] %s: %v\n", filepath.Base(res.path), err)
+				continue
+			}
+			atomic.AddInt64(&processed, 1)
+
+			p := atomic.LoadInt64(&processed)
+			f := atomic.LoadInt64(&failed)
+			total := p + f
+			elapsed := time.Since(start).Seconds()
+			rate := float64(total) / elapsed
+			fmt.Printf("  Progress: %d OK, %d fail | %.2f img/s | elapsed: %.0fs\n",
+				p, f, rate, elapsed)
+		}
+	}()
+
+	for _, path := range jobs {
+		visionQ <- path
 	}
-	close(jobs)
-	wg.Wait()
+	close(visionQ)
+	visionWg.Wait()
+	close(llmQ)
+	llmWg.Wait()
+	close(dbQ)
+	dbWg.Wait()
 
 	total := time.Since(start)
+	p := atomic.LoadInt64(&processed)
+	f := atomic.LoadInt64(&failed)
 	fmt.Printf("\n=== DONE ===\n")
-	fmt.Printf("Workers: %d | Processed: %d | Skipped: %d | Failed: %d\n", workers, processed, skipped, failed)
-	if len(files) > 0 {
-		fmt.Printf("Total time: %.1f minutes (%.1f sec/image)\n", total.Minutes(), total.Seconds()/float64(len(files)))
+	fmt.Printf("Vision workers: %d | LLM workers: 1\n", visionWorkers)
+	fmt.Printf("Processed: %d | Skipped: %d | Failed: %d\n", p, skipped, f)
+	if len(jobs) > 0 {
+		fmt.Printf("Total time: %.1f minutes (%.1f sec/image)\n",
+			total.Minutes(), total.Seconds()/float64(len(jobs)))
 	}
 }
 

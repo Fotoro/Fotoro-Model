@@ -5,183 +5,194 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
-	"strconv"
+	"os/exec"
+	"regexp"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
+const SystemPrompt = "You are a precise visual analyst. Describe personal photos accurately in 2-3 dense sentences. State the main event, setting, and specific details including people's clothing, facial expressions, and notable objects. Be direct. Do not start with 'The image shows' or 'In this picture'."
+
 type Client struct {
-	baseURL string
-	model   string
-	client  *http.Client
+	addr       string
+	model      string
+	httpClient *http.Client
+	serverCmd  *exec.Cmd
+	started    bool
+	mu         sync.Mutex
+	transport  *http.Transport
 }
 
-type ImageAnalysis struct {
-	Category    string   `json:"category"`
-	Caption     string   `json:"caption"`
-	Tags        []string `json:"tags"`
-	HasText     bool     `json:"has_text"`
-	HasFaces    bool     `json:"has_faces"`
-	Orientation string   `json:"orientation"`
+type Analysis struct {
+	Caption     string
+	Category    string
+	Tags        []string
+	HasText     bool
+	HasFaces    bool
+	Orientation string
 }
 
 func NewClient(baseURL, model string) *Client {
-	if baseURL == "" {
-		baseURL = "http://localhost:11434"
+	addr := os.Getenv("LLAMA_ADDR")
+	if addr == "" {
+		addr = "http://127.0.0.1:8081"
 	}
-	timeout := 300 * time.Second
-	if t := os.Getenv("FOTORO_TIMEOUT"); t != "" {
-		if d, err := strconv.Atoi(t); err == nil && d > 0 {
-			timeout = time.Duration(d) * time.Second
-		}
+	transport := &http.Transport{
+		MaxIdleConns:        10,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     120 * time.Second,
 	}
 	return &Client{
-		baseURL: baseURL,
-		model:   model,
-		client:  &http.Client{Timeout: timeout},
+		addr:       addr,
+		model:      model,
+		httpClient: &http.Client{Timeout: 120 * time.Second, Transport: transport},
+		transport:  transport,
 	}
 }
 
-func (c *Client) HealthCheck() error {
-	resp, err := c.client.Get(c.baseURL + "/api/tags")
+func (c *Client) lazyStart() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.started {
+		return nil
+	}
+	modelPath := os.Getenv("FOTORO_MODEL_PATH")
+	mmprojPath := os.Getenv("FOTORO_MMPROJ_PATH")
+	if modelPath == "" || mmprojPath == "" {
+		return fmt.Errorf("set FOTORO_MODEL_PATH and FOTORO_MMPROJ_PATH env vars")
+	}
+	if err := c.startServer(modelPath, mmprojPath); err != nil {
+		return err
+	}
+	c.started = true
+	return nil
+}
+
+func (c *Client) startServer(modelPath, mmprojPath string) error {
+	if c.healthCheck() == nil {
+		return nil
+	}
+
+	exe := os.Getenv("LLAMA_SERVER_BIN")
+	if exe == "" {
+		for _, path := range []string{
+			"./llama-server",
+			"./llama.cpp/build/bin/llama-server",
+			"./llama.cpp/build/llama-server",
+			"../llama.cpp/build/bin/llama-server",
+			"/usr/local/bin/llama-server",
+		} {
+			if _, err := os.Stat(path); err == nil {
+				exe = path
+				break
+			}
+		}
+		if exe == "" {
+			exe = "llama-server"
+		}
+	}
+
+	threads := getEnv("LLAMA_THREADS", "4")
+	ctxSize := getEnv("LLAMA_CTX_SIZE", "2048")
+
+	addr := strings.TrimPrefix(c.addr, "http://")
+	host := addr
+	port := "8081"
+	if idx := strings.LastIndex(addr, ":"); idx > 0 {
+		host = addr[:idx]
+		port = addr[idx+1:]
+	}
+
+	args := []string{
+		"-m", modelPath,
+		"--mmproj", mmprojPath,
+		"--host", host,
+		"--port", port,
+		"--threads", threads,
+		"--ctx-size", ctxSize,
+		"--batch-size", "1024",
+		"--ubatch-size", "1024",
+		"--cache-type-k", "q8_0",
+		"--cache-type-v", "q8_0",
+		"--mlock",
+		"--no-mmap",
+		"--cache-prompt",
+		"--image-min-tokens", "128",
+		"--image-max-tokens", "512",
+	}
+	if os.Getenv("LLAMA_FLASH_ATTN") == "1" {
+		args = append(args, "--flash-attn", "on")
+	}
+
+	c.serverCmd = exec.Command(exe, args...)
+	c.serverCmd.Stdout = os.Stdout
+	c.serverCmd.Stderr = os.Stderr
+	c.serverCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	fmt.Printf("[LLM] Starting llama-server (3B): %s %v\\n", exe, args)
+	if err := c.serverCmd.Start(); err != nil {
+		return fmt.Errorf("start llama-server: %w", err)
+	}
+
+	for i := 0; i < 100; i++ {
+		if c.healthCheck() == nil {
+			fmt.Println("[LLM] 3B Server ready")
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("llama-server failed to start")
+}
+
+func (c *Client) StopServer() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.serverCmd != nil && c.serverCmd.Process != nil {
+		c.serverCmd.Process.Signal(syscall.SIGTERM)
+		time.Sleep(500 * time.Millisecond)
+		c.serverCmd.Process.Kill()
+	}
+}
+
+func (c *Client) healthCheck() error {
+	resp, err := c.httpClient.Get(c.addr + "/health")
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != 200 {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 	return nil
 }
 
-func baseModelName(fullName string) string {
-	if idx := strings.LastIndex(fullName, "/"); idx != -1 {
-		fullName = fullName[idx+1:]
-	}
-	return fullName
+func (c *Client) HealthCheck() error {
+	return c.lazyStart()
 }
 
 func (c *Client) VerifyModel() error {
-	resp, err := c.client.Get(c.baseURL + "/api/tags")
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Models []struct {
-			Name string `json:"name"`
-		} `json:"models"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return err
-	}
-
-	var names []string
-	for _, m := range result.Models {
-		name := baseModelName(m.Name)
-		names = append(names, name)
-		if name == c.model || strings.HasPrefix(name, c.model+":") {
-			return nil
-		}
-	}
-	return fmt.Errorf("model %q not found in Ollama.\nAvailable: %v\n\nTry: export FOTORO_MODEL=%s", c.model, names, names[0])
+	return c.lazyStart()
 }
 
-func stripMarkdownFences(s string) string {
-	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "```json")
-	s = strings.TrimPrefix(s, "```")
-	s = strings.TrimSuffix(s, "```")
-	return strings.TrimSpace(s)
-}
-
-// parseKeyValue tries to extract fields from plain text like:
-//   Category: photo
-//   Caption: A cat sitting...
-func parseKeyValue(text string) *ImageAnalysis {
-	a := &ImageAnalysis{
-		Category:    "unknown",
-		Caption:     "",
-		Tags:        []string{},
-		HasText:     false,
-		HasFaces:    false,
-		Orientation: "unknown",
+// ORIGINAL sampling params that produced good captions
+func (c *Client) AnalyzeImage(vlmBytes []byte) (Analysis, error) {
+	if err := c.lazyStart(); err != nil {
+		return Analysis{}, err
 	}
 
-	lines := strings.Split(text, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		lower := strings.ToLower(line)
+	b64 := base64.StdEncoding.EncodeToString(vlmBytes)
 
-		// Category
-		if strings.HasPrefix(lower, "category:") {
-			a.Category = strings.TrimSpace(strings.TrimPrefix(line, "Category:"))
-			a.Category = strings.TrimSpace(strings.TrimPrefix(a.Category, "category:"))
-		}
-		// Caption
-		if strings.HasPrefix(lower, "caption:") {
-			a.Caption = strings.TrimSpace(strings.TrimPrefix(line, "Caption:"))
-			a.Caption = strings.TrimSpace(strings.TrimPrefix(a.Caption, "caption:"))
-		}
-		// Tags
-		if strings.HasPrefix(lower, "tags:") {
-			tagsStr := strings.TrimSpace(strings.TrimPrefix(line, "Tags:"))
-			tagsStr = strings.TrimSpace(strings.TrimPrefix(tagsStr, "tags:"))
-			for _, t := range strings.Split(tagsStr, ",") {
-				t = strings.TrimSpace(t)
-				if t != "" {
-					a.Tags = append(a.Tags, t)
-				}
-			}
-		}
-		// HasText
-		if strings.HasPrefix(lower, "hastext:") || strings.HasPrefix(lower, "has_text:") {
-			v := strings.TrimSpace(line[strings.Index(line, ":")+1:])
-			if strings.Contains(strings.ToLower(v), "yes") || strings.Contains(strings.ToLower(v), "true") {
-				a.HasText = true
-			}
-		}
-		// HasFaces
-		if strings.HasPrefix(lower, "hasfaces:") || strings.HasPrefix(lower, "has_faces:") {
-			v := strings.TrimSpace(line[strings.Index(line, ":")+1:])
-			if strings.Contains(strings.ToLower(v), "yes") || strings.Contains(strings.ToLower(v), "true") {
-				a.HasFaces = true
-			}
-		}
-		// Orientation
-		if strings.HasPrefix(lower, "orientation:") {
-			a.Orientation = strings.TrimSpace(strings.TrimPrefix(line, "Orientation:"))
-			a.Orientation = strings.TrimSpace(strings.TrimPrefix(a.Orientation, "orientation:"))
-		}
-	}
-
-	// Cleanup
-	a.Category = strings.ToLower(strings.TrimSpace(a.Category))
-	a.Orientation = strings.ToLower(strings.TrimSpace(a.Orientation))
-	if a.Caption == "" {
-		// If no caption line found, use the whole text as caption (fallback)
-		a.Caption = strings.ReplaceAll(text, "\n", " ")
-	}
-	return a
-}
-
-func (c *Client) AnalyzeImage(jpegBytes []byte) (*ImageAnalysis, error) {
-	b64 := base64.StdEncoding.EncodeToString(jpegBytes)
-
-	// Dead simple prompt. No rules, no JSON, no keys. Just describe the image.
-	promptText := `Describe the image accurately in 2 to 3 dense sentences. State the main event or action, the setting, and specific details including people's clothing, facial expressions, and notable objects. Be direct. Do not start with "The image shows" or "In this picture".`
-
-	payload := map[string]interface{}{
-		"model":  c.model,
-		"stream": false,
+	reqBody := map[string]interface{}{
+		"model": c.model,
 		"messages": []map[string]interface{}{
+			{
+				"role":    "system",
+				"content": SystemPrompt,
+			},
 			{
 				"role": "user",
 				"content": []map[string]interface{}{
@@ -193,77 +204,114 @@ func (c *Client) AnalyzeImage(jpegBytes []byte) (*ImageAnalysis, error) {
 					},
 					{
 						"type": "text",
-						"text": promptText,
+						"text": "Describe this photo concisely.",
 					},
 				},
 			},
 		},
-		"temperature": 0.1, // Gives it just enough room to breathe without hallucinating
-		"max_tokens":  60,  // Keep it short!
+		"max_tokens":  128,
+		"temperature": 0.2,
+		"stop":        []string{"USER:", "ASSISTANT:", "</s>", "|im_end|"},
+		"cache_prompt": true,
 	}
-	body, err := json.Marshal(payload)
+
+	body, _ := json.Marshal(reqBody)
+	resp, err := c.httpClient.Post(c.addr+"/v1/chat/completions", "application/json", bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return Analysis{}, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return Analysis{}, err
+	}
+	if len(result.Choices) == 0 {
+		return Analysis{}, fmt.Errorf("no response")
 	}
 
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * 2 * time.Second)
-		}
+	raw := result.Choices[0].Message.Content
+	analysis := parseAnalysis(raw)
+	analysis.Caption = addPrefix(analysis.Caption, analysis.Category)
+	
+	return analysis, nil
+}
 
-		resp, err := c.client.Post(c.baseURL+"/v1/chat/completions", "application/json", bytes.NewReader(body))
-		if err != nil {
-			lastErr = err
-			continue
-		}
+// Binary prefix: Photo vs Document only
+func addPrefix(caption, category string) string {
+	if category == "documents" {
+		return "Document: " + caption
+	}
+	return "Photo: " + caption
+}
 
-		respBody, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			continue
-		}
+func (c *Client) GetEmbedding(text string) ([]float32, error) {
+	return nil, fmt.Errorf("GetEmbedding disabled: use EMBED_ADDR with a dedicated embed model")
+}
 
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
-			continue
-		}
+func (c *Client) ExpandQuery(q string) string {
+	return q
+}
 
-		var result struct {
-			Choices []struct {
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			} `json:"choices"`
-		}
-		if err := json.Unmarshal(respBody, &result); err != nil {
-			lastErr = fmt.Errorf("json parse: %w | raw: %s", err, string(respBody))
-			continue
-		}
+// Binary classification: photo vs document
+func parseAnalysis(raw string) Analysis {
+	a := Analysis{Category: "photo", Orientation: "landscape"}
+	lines := strings.Split(raw, "\\n")
+	if len(lines) > 0 {
+		a.Caption = strings.TrimSpace(lines[0])
+	}
+	lower := strings.ToLower(raw)
 
-		if len(result.Choices) == 0 {
-			lastErr = fmt.Errorf("empty choices")
-			continue
-		}
-
-		content := stripMarkdownFences(result.Choices[0].Message.Content)
-		if content == "" {
-			lastErr = fmt.Errorf("empty content")
-			continue
-		}
-
-		// Just shove the entire raw output directly into the caption.
-		// Default everything else so the database doesn't complain.
-		return &ImageAnalysis{
-			Caption:     strings.ReplaceAll(strings.TrimSpace(content), "\n", " "),
-			Category:    "unknown",
-			Tags:        []string{},
-			HasText:     false,
-			HasFaces:    false,
-			Orientation: "unknown",
-		}, nil
+	switch {
+	case strings.Contains(lower, "document") || strings.Contains(lower, "text") ||
+		 strings.Contains(lower, "receipt") || strings.Contains(lower, "paper") ||
+		 strings.Contains(lower, "handwriting") || strings.Contains(lower, "handwritten") ||
+		 strings.Contains(lower, "notes") || strings.Contains(lower, "notebook") ||
+		 strings.Contains(lower, "letter") || strings.Contains(lower, "form") ||
+		 strings.Contains(lower, "invoice") || strings.Contains(lower, "bill") ||
+		 strings.Contains(lower, "page") || strings.Contains(lower, "writing") ||
+		 strings.Contains(lower, "printed") || strings.Contains(lower, "sign") ||
+		 strings.Contains(lower, "label") || strings.Contains(lower, "ticket") ||
+		 strings.Contains(lower, "certificate") || strings.Contains(lower, "contract") ||
+		 strings.Contains(lower, "menu") || strings.Contains(lower, "receipt"):
+		a.Category = "documents"
+		a.HasText = true
+	default:
+		a.Category = "photo"
 	}
 
-	return nil, fmt.Errorf("ollama failed after 3 attempts: %w", lastErr)
+	re := regexp.MustCompile(`\\b\\w{4,}\\b`)
+	words := re.FindAllString(lower, -1)
+	seen := make(map[string]bool)
+	for _, w := range words {
+		if !isStopWord(w) {
+			seen[w] = true
+		}
+	}
+	for t := range seen {
+		a.Tags = append(a.Tags, t)
+	}
+	return a
+}
+
+func isStopWord(w string) bool {
+	switch w {
+	case "the", "and", "this", "that", "with", "from", "image", "photo", "picture",
+		 "shows", "showing", "depicts", "features", "displays":
+		return true
+	}
+	return false
+}
+
+func getEnv(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
 }

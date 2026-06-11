@@ -1,45 +1,80 @@
+# =========================
 # Python
+# =========================
 __pycache__/
 *.py[cod]
 *.so
 
 # Virtual environments
 venv/
-.env/
+.venv/
+env/
+.env
 
-# Model caches
-cache/
+# =========================
+# Go
+# =========================
+bin/
+dist/
+
+# =========================
+# AI Models
+# =========================
 models/
+cache/
+.huggingface/
+.gguf
+.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
 
-# Generated indexes/data
+# =========================
+# Generated Data
+# =========================
 index/
 face_crops/
 person_albums/
 
-# User/private images
+# =========================
+# User Images
+# =========================
 images/
 images-test/
 
-# OS files
-.DS_Store
-Thumbs.db
-
-.cache/
-# IDE
-.vscode/
-.idea/
-
-# Logs
-*.log
-
-# Jupyter
-.ipynb_checkpoints/
-
-# HuggingFace cache
-.huggingface/
-
-
-# database
+# =========================
+# Databases
+# =========================
 *.db
 *.db-shm
 *.db-wal
+*.sqlite
+*.sqlite3
+
+# =========================
+# Logs
+# =========================
+*.log
+
+# =========================
+# IDE
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# OS Files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Misc Cache
+# =========================
+.cache/
