@@ -5,11 +5,12 @@ import (
 	"os"
 
 	"fotoro/cmd"
+	"fotoro/internal/system"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: fotoro [ingest|daemon|server|app|backfill]")
+		fmt.Println("Usage: fotoro [ingest|daemon|server|app|backfill|backfill-thumbs|system]")
 		os.Exit(1)
 	}
 
@@ -45,6 +46,24 @@ func main() {
 		cmd.RunApp(dbPath, model)
 	case "backfill":
 		cmd.RunBackfill(dbPath, model)
+	case "backfill-thumbs":
+		cmd.RunBackfillThumbs(dbPath)
+	case "system":
+		specs, err := system.Detect()
+		if err != nil {
+			fmt.Printf("Error detecting system: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("══════════════════════════════════════════════════")
+		fmt.Println("  Fotoro System Check")
+		fmt.Println("══════════════════════════════════════════════════")
+		fmt.Println(specs.String())
+		fmt.Println("")
+		fmt.Println("Recommended Configuration:")
+		for k, v := range specs.RecommendConfig() {
+			fmt.Printf("  %s=%s\n", k, v)
+		}
+		fmt.Println("══════════════════════════════════════════════════")
 	default:
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
 		os.Exit(1)

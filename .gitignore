@@ -78,3 +78,6 @@ Thumbs.db
 # Misc Cache
 # =========================
 .cache/
+
+docker-compose.yml
+Dockerfile

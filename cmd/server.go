@@ -70,7 +70,8 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	var results []search.Result
 
 	if q != "" {
-		expanded := s.ollama.ExpandQuery(q)
+		expander := search.NewQueryExpander()
+		expanded := expander.Expand(q)
 		emb, err := s.embed.GetEmbedding(expanded)
 		if err == nil && len(emb) > 0 {
 			results = s.index.Search(emb, 50)
@@ -281,6 +282,29 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		"caption":  analysis.Caption,
 		"category": analysis.Category,
 	})
+}
+
+var snapCache sync.Map // hash → embedding
+
+func (s *Server) handleSimilar(w http.ResponseWriter, r *http.Request) {
+    // ... decode image ...
+    
+    // Check cache first
+    imgHash := sha256.Sum256(imgData)
+    hashStr := fmt.Sprintf("%x", imgHash[:8])
+    
+    if cached, ok := snapCache.Load(hashStr); ok {
+        results := s.index.Search(cached.([]float32), 20)
+        // return cached results
+    }
+    
+    // Otherwise: analyze, embed, cache, search
+    analysis, _ := s.ollama.AnalyzeImage(imgData)
+    emb, _ := s.embed.GetEmbedding(analysis.Caption)
+    snapCache.Store(hashStr, emb)
+    
+    results := s.index.Search(emb, 20)
+    // ...
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
