@@ -1,0 +1,19 @@
+[package]
+name = "fotoro-desktop"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.28", features = ["default"] }
+egui_extras = { version = "0.28", features = ["image"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+tokio = { version = "1.38", features = ["rt-multi-thread"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+urlencoding = "2.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

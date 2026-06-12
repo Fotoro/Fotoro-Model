@@ -11,6 +11,10 @@ venv/
 env/
 .env
 
+
+desktop/target/
+desktop/Cargo.lock
+
 # =========================
 # Go
 # =========================
