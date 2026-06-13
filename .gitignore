@@ -34,6 +34,8 @@ cache/
 *.pth
 *.ckpt
 
+desktop/build/
+
 # =========================
 # Generated Data
 # =========================
