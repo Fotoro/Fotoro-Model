@@ -18,13 +18,10 @@ type Vector struct {
 	Data     []float32
 }
 
-// Index holds all embeddings in memory for fast cosine search.
-// For 3k images × 768 dims × 4 bytes = ~9MB RAM. Trivial.
 type Index struct {
 	mu      sync.RWMutex
 	vectors []Vector
-	// Precomputed norms for speed
-	norms []float32
+	norms   []float32
 }
 
 func NewIndex() *Index {
@@ -52,7 +49,6 @@ func FloatsToBytes(f []float32) []byte {
 	return buf.Bytes()
 }
 
-// fastCosine uses precomputed norms for O(n) instead of O(3n)
 func fastCosine(a []float32, b []float32, bNorm float32) float32 {
 	var dot float32
 	for i := range a {
@@ -119,16 +115,14 @@ func (idx *Index) Search(query []float32, topN int) []Result {
 	copy(norms, idx.norms)
 	idx.mu.RUnlock()
 
-	// Score all vectors
 	scored := make([]Result, 0, len(vecs))
 	for i, v := range vecs {
 		score := fastCosine(query, v.Data, norms[i]*qNorm)
-		if score > 0.25 {
+		if score > 0.10 {
 			scored = append(scored, Result{v, score})
 		}
 	}
 
-	// Sort by score descending
 	sort.Slice(scored, func(i, j int) bool {
 		return scored[i].Score > scored[j].Score
 	})
@@ -144,4 +138,10 @@ func (idx *Index) Add(v Vector) {
 	idx.vectors = append(idx.vectors, v)
 	idx.norms = append(idx.norms, vectorNorm(v.Data))
 	idx.mu.Unlock()
+}
+
+func (idx *Index) Len() int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return len(idx.vectors)
 }

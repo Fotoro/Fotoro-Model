@@ -11,6 +11,9 @@ venv/
 env/
 .env
 
+ARCHITECTURE.MD
+
+supabase_schema.md
 
 desktop/target/
 desktop/Cargo.lock

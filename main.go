@@ -5,23 +5,16 @@ import (
 	"os"
 
 	"fotoro/cmd"
-	"fotoro/internal/system"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: fotoro [ingest|daemon|server|app|backfill|backfill-thumbs|system]")
+		printHelp()
 		os.Exit(1)
 	}
 
-	dbPath := os.Getenv("FOTORO_DB")
-	if dbPath == "" {
-		dbPath = "fotoro.db"
-	}
-	model := os.Getenv("FOTORO_MODEL")
-	if model == "" {
-		model = "llava-phi3"
-	}
+	dbPath := getEnv("FOTORO_DB", "./fotoro.db")
+	model := getEnv("FOTORO_MODEL", "qwen2.5-vl-3b")
 
 	switch os.Args[1] {
 	case "ingest":
@@ -30,17 +23,8 @@ func main() {
 			os.Exit(1)
 		}
 		cmd.RunIngest(os.Args[2], dbPath, model)
-	case "daemon":
-		watchDir := os.Getenv("FOTORO_WATCH_DIR")
-		if watchDir == "" {
-			watchDir = "./images"
-		}
-		cmd.RunDaemon(watchDir, dbPath, model)
 	case "server":
-		addr := os.Getenv("FOTORO_ADDR")
-		if addr == "" {
-			addr = ":8080"
-		}
+		addr := getEnv("FOTORO_ADDR", "127.0.0.1:8765")
 		cmd.RunServer(addr, dbPath, model)
 	case "app":
 		cmd.RunApp(dbPath, model)
@@ -49,23 +33,62 @@ func main() {
 	case "backfill-thumbs":
 		cmd.RunBackfillThumbs(dbPath)
 	case "system":
-		specs, err := system.Detect()
-		if err != nil {
-			fmt.Printf("Error detecting system: %v\n", err)
-			os.Exit(1)
+		cmd.RunSystemCheck()
+	case "setup":
+		cmd.RunSetup(dbPath, model)
+	case "scheduler":
+		cmd.RunScheduler(dbPath, model)
+	case "tailscale":
+		if len(os.Args) < 3 {
+			fmt.Println(`Tailscale operations:
+  fotoro tailscale status     # Show connection status
+  fotoro tailscale connect    # Connect to tailnet
+  fotoro tailscale disconnect # Disconnect from tailnet
+  fotoro tailscale info       # Show IP and DNS info`)
+			os.Exit(0)
 		}
-		fmt.Println("══════════════════════════════════════════════════")
-		fmt.Println("  Fotoro System Check")
-		fmt.Println("══════════════════════════════════════════════════")
-		fmt.Println(specs.String())
-		fmt.Println("")
-		fmt.Println("Recommended Configuration:")
-		for k, v := range specs.RecommendConfig() {
-			fmt.Printf("  %s=%s\n", k, v)
-		}
-		fmt.Println("══════════════════════════════════════════════════")
+		cmd.RunTailscale(os.Args[2], dbPath)
 	default:
-		fmt.Printf("Unknown command: %s\n", os.Args[1])
+		fmt.Printf("Unknown command: %s\\n", os.Args[1])
+		printHelp()
 		os.Exit(1)
 	}
+}
+
+func printHelp() {
+	fmt.Println(`Fotoro — Self-hosted photo intelligence
+
+Usage: fotoro [command]
+
+Commands:
+  app          Launch desktop GUI (backend + Qt6 interface)
+  server       Start HTTP API server only
+  ingest       Batch process images from directory
+  backfill     Generate embeddings for existing images
+  backfill-thumbs  Generate missing thumbnails
+  scheduler    Run scheduled processing (manual)
+  setup        Interactive first-time setup wizard
+  system       Show system specs and recommendations
+  tailscale    Tailscale operations (connect/disconnect/status)
+
+Environment:
+  FOTORO_DB          Database path (default: ./fotoro.db)
+  FOTORO_ADDR        Server bind address (default: 127.0.0.1:8765)
+  FOTORO_MODEL       VLM model name (default: qwen2.5-vl-3b)
+  SUPABASE_URL       Supabase project URL
+  SUPABASE_ANON_KEY  Supabase anon key
+  GOOGLE_CLIENT_ID   Google OAuth client ID
+
+Examples:
+  fotoro app                 # Start GUI
+  fotoro server              # Start API server
+  fotoro ingest ./photos     # Process photos directory
+  fotoro scheduler           # Run pending queue now`)
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

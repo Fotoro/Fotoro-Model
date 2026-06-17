@@ -12,6 +12,7 @@ import (
 
 	"fotoro/internal/db"
 	"fotoro/internal/ollama"
+	"fotoro/internal/search"
 	"fotoro/internal/validate"
 )
 
@@ -27,6 +28,11 @@ func RunIngest(dir, dbPath, model string) {
 	client := ollama.NewClient("", model)
 	if err := client.HealthCheck(); err != nil {
 		fmt.Printf("[INIT] Backend will start on first request (%v)\n", err)
+	}
+
+	embedClient := ollama.NewEmbedClient()
+	if err := embedClient.HealthCheck(); err != nil {
+		fmt.Println("[WARN] Embed server not running. Search will be FTS-only until you run: fotoro backfill")
 	}
 
 	files := collectImages(dir)
@@ -67,8 +73,6 @@ func RunIngest(dir, dbPath, model string) {
 		return
 	}
 
-	// OPTIMAL: 2 vision workers for 1 LLM worker
-	// Vision ~3s, LLM ~25s → 2 vision workers can prep ahead while LLM works
 	visionWorkers := 2
 	if w := os.Getenv("FOTORO_VISION_WORKERS"); w != "" {
 		if n, err := strconv.Atoi(w); err == nil && n > 0 {
@@ -76,7 +80,7 @@ func RunIngest(dir, dbPath, model string) {
 		}
 	}
 	
-	llmWorkers := 1  // Confirmed: single worker = best latency
+	llmWorkers := 1
 	fmt.Printf("[INIT] Vision workers: %d | LLM workers: %d\n", visionWorkers, llmWorkers)
 
 	type visionResult struct {
@@ -96,7 +100,6 @@ func RunIngest(dir, dbPath, model string) {
 	var processed, skipped, failed int64
 	start := time.Now()
 
-	// Stage 1: Vision prep (2 workers, quiet logging)
 	var visionWg sync.WaitGroup
 	for i := 0; i < visionWorkers; i++ {
 		visionWg.Add(1)
@@ -109,6 +112,17 @@ func RunIngest(dir, dbPath, model string) {
 					fmt.Printf("[V%d] [SKIP] %s: prep error: %v\n", id, filepath.Base(path), err)
 					continue
 				}
+
+				if meta.PHash != "" {
+					var dupHash string
+					database.QueryRow("SELECT hash FROM images WHERE phash = ?", meta.PHash).Scan(&dupHash)
+					if dupHash != "" {
+						fmt.Printf("[V%d] [SKIP] %s: perceptual duplicate of %s\n", id, filepath.Base(path), dupHash[:8])
+						atomic.AddInt64(&skipped, 1)
+						continue
+					}
+				}
+
 				if err := validate.SaveThumbnails(cacheDir, meta); err != nil {
 					fmt.Printf("[V%d] [WARN] %s: thumbs: %v\n", id, filepath.Base(path), err)
 				}
@@ -117,7 +131,6 @@ func RunIngest(dir, dbPath, model string) {
 		}(i)
 	}
 
-	// Stage 2: Single LLM worker (best latency)
 	var llmWg sync.WaitGroup
 	llmWg.Add(1)
 	go func() {
@@ -129,8 +142,8 @@ func RunIngest(dir, dbPath, model string) {
 				atomic.AddInt64(&failed, 1)
 				fmt.Printf("[LLM] [FAIL] %s: %v\n", filepath.Base(res.path), err)
 				database.Exec(
-					"INSERT OR IGNORE INTO images (path, hash, caption, category, tier) VALUES (?, ?, ?, ?, ?)",
-					res.meta.Path, res.meta.Hash, "", "failed", "bulk",
+					"INSERT OR IGNORE INTO images (path, hash, caption, category, tier, taken_at, phash) VALUES (?, ?, ?, ?, ?, ?, ?)",
+					res.meta.Path, res.meta.Hash, "", "failed", "bulk", res.meta.TakenAt, res.meta.PHash,
 				)
 				continue
 			}
@@ -141,7 +154,6 @@ func RunIngest(dir, dbPath, model string) {
 		}
 	}()
 
-	// Stage 3: DB writer
 	var dbWg sync.WaitGroup
 	dbWg.Add(1)
 	go func() {
@@ -152,11 +164,11 @@ func RunIngest(dir, dbPath, model string) {
 				tags = strings.Join(res.analysis.Tags, " ")
 			}
 			_, err := database.Exec(
-				`INSERT INTO images (path, hash, caption, category, tags, has_text, has_faces, orientation, tier, processed_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				`INSERT INTO images (path, hash, caption, category, tags, has_text, has_faces, orientation, tier, processed_at, taken_at, phash)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				res.meta.Path, res.meta.Hash, res.analysis.Caption, res.analysis.Category,
 				tags, boolToInt(res.analysis.HasText), boolToInt(res.analysis.HasFaces),
-				res.analysis.Orientation, "bulk", time.Now(),
+				res.analysis.Orientation, "bulk", time.Now(), res.meta.TakenAt, res.meta.PHash,
 			)
 			if err != nil {
 				atomic.AddInt64(&failed, 1)
@@ -165,13 +177,21 @@ func RunIngest(dir, dbPath, model string) {
 			}
 			atomic.AddInt64(&processed, 1)
 
+			if emb, err := embedClient.GetEmbedding(res.analysis.Caption); err == nil {
+				blob := search.FloatsToBytes(emb)
+				database.Exec("UPDATE images SET embedding = ? WHERE hash = ?", blob, res.meta.Hash)
+			} else {
+				fmt.Printf("[EMBED] [FAIL] %s: %v\n", filepath.Base(res.path), err)
+			}
+
 			p := atomic.LoadInt64(&processed)
 			f := atomic.LoadInt64(&failed)
-			total := p + f
+			s := atomic.LoadInt64(&skipped)
+			total := p + f + s
 			elapsed := time.Since(start).Seconds()
 			rate := float64(total) / elapsed
-			fmt.Printf("  Progress: %d OK, %d fail | %.2f img/s | elapsed: %.0fs\n",
-				p, f, rate, elapsed)
+			fmt.Printf("  Progress: %d OK, %d skip, %d fail | %.2f img/s | elapsed: %.0fs\n",
+				p, s, f, rate, elapsed)
 		}
 	}()
 
@@ -188,9 +208,10 @@ func RunIngest(dir, dbPath, model string) {
 	total := time.Since(start)
 	p := atomic.LoadInt64(&processed)
 	f := atomic.LoadInt64(&failed)
+	s := atomic.LoadInt64(&skipped)
 	fmt.Printf("\n=== DONE ===\n")
 	fmt.Printf("Vision workers: %d | LLM workers: %d\n", visionWorkers, llmWorkers)
-	fmt.Printf("Processed: %d | Skipped: %d | Failed: %d\n", p, skipped, f)
+	fmt.Printf("Processed: %d | Skipped: %d | Failed: %d\n", p, s, f)
 	if len(jobs) > 0 {
 		fmt.Printf("Total time: %.1f minutes (%.1f sec/image)\n",
 			total.Minutes(), total.Seconds()/float64(len(jobs)))

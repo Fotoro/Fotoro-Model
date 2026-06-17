@@ -11,6 +11,7 @@ import (
 
 	"fotoro/internal/db"
 	"fotoro/internal/ollama"
+	"fotoro/internal/search"
 	"fotoro/internal/validate"
 
 	"github.com/fsnotify/fsnotify"
@@ -24,6 +25,7 @@ func RunDaemon(watchDir, dbPath, model string) {
 	defer database.Close()
 
 	client := ollama.NewClient("", model)
+	embedClient := ollama.NewEmbedClient()
 	cacheDir := filepath.Join(filepath.Dir(dbPath), ".cache")
 
 	watcher, err := fsnotify.NewWatcher()
@@ -47,7 +49,6 @@ func RunDaemon(watchDir, dbPath, model string) {
 	pending := make(map[string]struct{})
 	var pendingMu sync.Mutex
 
-	// ── THREE-STAGE PIPELINE (same as ingest, but continuous) ────────────────
 	type visionResult struct {
 		path string
 		meta *validate.ImageMeta
@@ -62,7 +63,6 @@ func RunDaemon(watchDir, dbPath, model string) {
 	llmQ := make(chan visionResult, 100)
 	dbQ := make(chan llmResult, 100)
 
-	// Stage 1: Vision prep workers
 	var visionWg sync.WaitGroup
 	for i := 0; i < runtime.NumCPU(); i++ {
 		visionWg.Add(1)
@@ -80,13 +80,20 @@ func RunDaemon(watchDir, dbPath, model string) {
 					fmt.Printf("[SKIP] %s: %v\n", filepath.Base(path), err)
 					continue
 				}
+				if meta.PHash != "" {
+					var dupHash string
+					database.QueryRow("SELECT hash FROM images WHERE phash = ?", meta.PHash).Scan(&dupHash)
+					if dupHash != "" {
+						fmt.Printf("[SKIP] %s: perceptual duplicate of %s\n", filepath.Base(path), dupHash[:8])
+						continue
+					}
+				}
 				_ = validate.SaveThumbnails(cacheDir, meta)
 				llmQ <- visionResult{path: path, meta: meta}
 			}
 		}()
 	}
 
-	// Stage 2: Single LLM worker (model stays hot, KV cache warm)
 	go func() {
 		for res := range llmQ {
 			t0 := time.Now()
@@ -100,7 +107,6 @@ func RunDaemon(watchDir, dbPath, model string) {
 		}
 	}()
 
-	// Stage 3: DB writer
 	go func() {
 		for res := range dbQ {
 			tags := ""
@@ -108,12 +114,16 @@ func RunDaemon(watchDir, dbPath, model string) {
 				tags = strings.Join(res.analysis.Tags, " ")
 			}
 			database.Exec(
-				`INSERT INTO images (path, hash, caption, category, tags, has_text, has_faces, orientation, tier, processed_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				`INSERT INTO images (path, hash, caption, category, tags, has_text, has_faces, orientation, tier, processed_at, taken_at, phash)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				res.meta.Path, res.meta.Hash, res.analysis.Caption, res.analysis.Category,
 				tags, boolToInt(res.analysis.HasText), boolToInt(res.analysis.HasFaces),
-				res.analysis.Orientation, "daemon", time.Now(),
+				res.analysis.Orientation, "daemon", time.Now(), res.meta.TakenAt, res.meta.PHash,
 			)
+			if emb, err := embedClient.GetEmbedding(res.analysis.Caption); err == nil {
+				blob := search.FloatsToBytes(emb)
+				database.Exec("UPDATE images SET embedding = ? WHERE hash = ?", blob, res.meta.Hash)
+			}
 			fmt.Printf("[OK] %s | %s\n", filepath.Base(res.path), res.analysis.Category)
 		}
 	}()

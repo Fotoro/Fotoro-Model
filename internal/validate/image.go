@@ -8,14 +8,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
+	"github.com/corona10/goimagehash"
 	"github.com/disintegration/imaging"
+	"github.com/rwcarlsen/goexif/exif"
 )
 
 const (
-	// AGGRESSIVE: Drop to 336px for speed
-	// 448px was accurate but 30-40s. 336px should be ~20-25s with acceptable quality.
-	// Qwen2.5-VL handles 336px fine — it's still above the 224px disaster zone.
 	VLMSize     = 336
 	ThumbSmall  = 256
 	ThumbMedium = 1024
@@ -30,6 +30,8 @@ type ImageMeta struct {
 	ThumbMedium []byte
 	Width       int
 	Height      int
+	TakenAt     time.Time
+	PHash       string
 }
 
 func FastHash(path string) (string, error) {
@@ -52,6 +54,31 @@ func FastHash(path string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+func extractDateTaken(path string) time.Time {
+	f, err := os.Open(path)
+	if err != nil {
+		return time.Time{}
+	}
+	defer f.Close()
+	x, err := exif.Decode(f)
+	if err != nil {
+		return time.Time{}
+	}
+	t, err := x.DateTime()
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+func computePHash(img image.Image) string {
+	hash, err := goimagehash.PerceptionHash(img)
+	if err != nil {
+		return ""
+	}
+	return hash.ToString()
 }
 
 func PrepareImage(path string) (*ImageMeta, error) {
@@ -91,25 +118,24 @@ func PrepareImage(path string) (*ImageMeta, error) {
 	w = img.Bounds().Dx()
 	h = img.Bounds().Dy()
 
-	// VLM input: 336px, fast resize
+	takenAt := extractDateTaken(path)
+	phash := computePHash(img)
+
 	vlmImg := img
 	if w > VLMSize || h > VLMSize {
 		vlmImg = imaging.Fit(img, VLMSize, VLMSize, imaging.Box)
 	}
 	var vlmBuf bytes.Buffer
-	// Quality 80: smaller payload = faster network + faster vision encoder
 	if err := imaging.Encode(&vlmBuf, vlmImg, imaging.JPEG, imaging.JPEGQuality(80)); err != nil {
 		return nil, err
 	}
 
-	// Small thumb
 	smallImg := imaging.Fit(img, ThumbSmall, ThumbSmall, imaging.Box)
 	var smallBuf bytes.Buffer
 	if err := imaging.Encode(&smallBuf, smallImg, imaging.JPEG, imaging.JPEGQuality(75)); err != nil {
 		return nil, err
 	}
 
-	// Medium thumb
 	medImg := imaging.Fit(img, ThumbMedium, ThumbMedium, imaging.Lanczos)
 	var medBuf bytes.Buffer
 	if err := imaging.Encode(&medBuf, medImg, imaging.JPEG, imaging.JPEGQuality(80)); err != nil {
@@ -124,6 +150,8 @@ func PrepareImage(path string) (*ImageMeta, error) {
 		ThumbMedium: medBuf.Bytes(),
 		Width:       w,
 		Height:      h,
+		TakenAt:     takenAt,
+		PHash:       phash,
 	}, nil
 }
 

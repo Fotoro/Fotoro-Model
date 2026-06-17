@@ -8,7 +8,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network)
 
 add_executable(fotoro main.cpp)
-target_link_libraries(fotoro PRIVATE Qt6::Widgets Qt6::Network)
+target_link_libraries(fotoro PRIVATE Qt6::Core Qt6::Widgets Qt6::Network)

@@ -8,10 +8,12 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"fotoro/internal/system"
 )
 
 func RunApp(dbPath, model string) {
-	// Check if backend is already running
+	// Check if backend already running
 	backendRunning := false
 	if resp, err := http.Get("http://127.0.0.1:8765/api/health"); err == nil {
 		resp.Body.Close()
@@ -21,24 +23,31 @@ func RunApp(dbPath, model string) {
 
 	// Start backend as detached process if not running
 	if !backendRunning {
+		modelPath := os.Getenv("FOTORO_MODEL_PATH")
+		if modelPath == "" {
+			modelPath = "./models/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf"
+		}
+		if ok, msg := system.CanStartLLM(modelPath); !ok {
+			fmt.Printf("[ERROR] Cannot start: %s\\n", msg)
+			fmt.Println("[HINT] Free up memory or run 'fotoro server' without LLM features")
+			os.Exit(1)
+		}
+
 		exe, _ := os.Executable()
 		cmd := exec.Command(exe, "server")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-		// Force the backend to listen on 8765 so the GUI knows where to find it
 		cmd.Env = append(os.Environ(), "FOTORO_ADDR=127.0.0.1:8765")
-		// Detach: put in new process group so terminal Ctrl+C doesn't kill it
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Setpgid: true,
 			Pgid:    0,
 		}
 		if err := cmd.Start(); err != nil {
-			fmt.Printf("Failed to start backend: %v\n", err)
+			fmt.Printf("Failed to start backend: %v\\n", err)
 			os.Exit(1)
 		}
 		fmt.Println("[INIT] Backend started on 127.0.0.1:8765")
 
-		// Wait for health
 		for i := 0; i < 50; i++ {
 			if resp, err := http.Get("http://127.0.0.1:8765/api/health"); err == nil {
 				resp.Body.Close()
@@ -48,32 +57,51 @@ func RunApp(dbPath, model string) {
 		}
 	}
 
-	// Find Python GUI script
+	// Find and launch Qt6 GUI
 	exe, _ := os.Executable()
 	dir := filepath.Dir(exe)
-	script := filepath.Join(dir, "fotoro-gui.py")
-	if _, err := os.Stat(script); os.IsNotExist(err) {
-		script = "fotoro-gui.py"
-	}
-	if _, err := os.Stat(script); os.IsNotExist(err) {
-		fmt.Println("fotoro-gui.py not found. Server is running at http://127.0.0.1:8765")
-		select {}
+
+	guiPaths := []string{
+		filepath.Join(dir, "fotoro-gui"),
+		filepath.Join(dir, "fotoro-desktop"),
+		"./fotoro-gui",
+		"./fotoro-desktop",
 	}
 
-	// Suppress MESA Vulkan warnings and launch GUI in its own process group
+	var guiPath string
+	for _, p := range guiPaths {
+		if _, err := os.Stat(p); err == nil {
+			guiPath = p
+			break
+		}
+	}
+
+	if guiPath == "" {
+		fmt.Println("[WARN] GUI binary not found. Building from source...")
+		buildCmd := exec.Command("go", "build", "-o", "fotoro-gui", "./gui")
+		buildCmd.Dir = filepath.Dir(exe)
+		if err := buildCmd.Run(); err != nil {
+			fmt.Println("[WARN] Could not build GUI. Server is running at http://127.0.0.1:8765")
+			fmt.Println("[INFO] Access the web interface or use API directly")
+			select {}
+		}
+		guiPath = "./fotoro-gui"
+	}
+
 	fmt.Println("[INIT] Launching GUI...")
-	cmd := exec.Command("python3", script)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), "MESA_DEBUG=0", "MESA_VK_WSI_PRESENT_MODE=fifo")
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
+	guiCmd := exec.Command(guiPath)
+	guiCmd.Stdout = os.Stdout
+	guiCmd.Stderr = os.Stderr
+	guiCmd.Env = append(os.Environ(),
+		"QT_QPA_PLATFORM=xcb",
+		"MESA_DEBUG=0",
+	)
+	guiCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if err := guiCmd.Run(); err != nil {
+		fmt.Printf("GUI exited: %v\\n", err)
 	}
 
-	if err := cmd.Run(); err != nil {
-		fmt.Printf("GUI exited: %v\n", err)
-	}
-
-	// Backend keeps running because it was detached. We exit here.
 	fmt.Println("[INIT] GUI closed. Backend still running on 127.0.0.1:8765")
+	fmt.Println("[INFO] Stop with: kill $(lsof -t -i:8765)")
 }
