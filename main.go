@@ -8,6 +8,8 @@ import (
 )
 
 func main() {
+	cmd.LoadDotEnv()
+
 	if len(os.Args) < 2 {
 		printHelp()
 		os.Exit(1)
@@ -36,6 +38,8 @@ func main() {
 		cmd.RunSystemCheck()
 	case "setup":
 		cmd.RunSetup(dbPath, model)
+	case "login":
+		cmd.RunLogin(dbPath)
 	case "scheduler":
 		cmd.RunScheduler(dbPath, model)
 	case "tailscale":
@@ -48,6 +52,8 @@ func main() {
 			os.Exit(0)
 		}
 		cmd.RunTailscale(os.Args[2], dbPath)
+	case "nodesync":
+		cmd.RunNodeSyncCLI(dbPath)
 	default:
 		fmt.Printf("Unknown command: %s\\n", os.Args[1])
 		printHelp()
@@ -68,6 +74,8 @@ Commands:
   backfill-thumbs  Generate missing thumbnails
   scheduler    Run scheduled processing (manual)
   setup        Interactive first-time setup wizard
+  login        Sign in via fotoro.vercel.app (links account to this install)
+  nodesync     Push Tailscale/server info to the website dashboard
   system       Show system specs and recommendations
   tailscale    Tailscale operations (connect/disconnect/status)
 
@@ -78,6 +86,8 @@ Environment:
   SUPABASE_URL       Supabase project URL
   SUPABASE_ANON_KEY  Supabase anon key
   GOOGLE_CLIENT_ID   Google OAuth client ID
+  FOTORO_AUTH_URL    Hosted login page (default: https://fotoro.vercel.app/login)
+  FOTORO_WEB_URL     Website origin for dashboard sync (default: derived from FOTORO_AUTH_URL)
 
 Examples:
   fotoro app                 # Start GUI

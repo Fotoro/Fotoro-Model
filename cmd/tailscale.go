@@ -35,11 +35,14 @@ func RunTailscale(action string, dbPath string) {
 		if database != nil {
 			ip, _ := ts.GetTailscaleIP()
 			tailnet, _ := ts.GetTailnetName()
+			magicDNS, _ := ts.GetMagicDNS()
 			database.UpdateServerConfig(map[string]interface{}{
 				"tailscale_enabled": 1,
 				"tailscale_ip":      ip,
 				"tailnet_name":      tailnet,
+				"tailnet_url":       magicDNS,
 			})
+			syncNodeFromDBQuiet(database)
 			database.Close()
 		}
 

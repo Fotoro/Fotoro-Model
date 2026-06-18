@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"fotoro/internal/auth"
@@ -44,6 +46,8 @@ type Server struct {
 var snapCache sync.Map
 
 func RunServer(addr, dbPath, model string) {
+	LoadDotEnv()
+
 	database, err := db.Open(dbPath)
 	if err != nil {
 		panic(err)
@@ -91,12 +95,22 @@ func RunServer(addr, dbPath, model string) {
 	}
 	s.loadStoredSession()
 
+	// Register node with website dashboard + periodic heartbeat
+	if complete, _ := database.IsSetupComplete(); complete {
+		go func() {
+			time.Sleep(2 * time.Second)
+			s.syncNodeToCloud()
+		}()
+		go s.runNodeHeartbeat()
+	}
+
 	mux := http.NewServeMux()
 
 	// Public
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/auth/status", s.handleAuthStatus)
 	mux.HandleFunc("/api/auth/session", s.handleAuthSession)
+	mux.HandleFunc("/api/auth/login-url", s.handleAuthLoginURL)
 	mux.HandleFunc("/api/setup/status", s.handleSetupStatus)
 	mux.HandleFunc("/auth/setup", s.handleAuthSetupPage)
 	mux.HandleFunc("/auth/callback", s.handleAuthCallbackPage)
@@ -124,7 +138,10 @@ func RunServer(addr, dbPath, model string) {
 	mux.HandleFunc("/api/scheduler/status", s.withAuth(s.handleSchedulerStatus))
 	mux.HandleFunc("/api/system/memory", s.withAuth(s.handleMemoryStatus))
 
+	registerGalleryRoutes(mux, s)
+
 	fmt.Printf("[SERVER] Running on %s\\n", addr)
+	go ensureTailscaleExpose(s, addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		panic(err)
 	}
@@ -133,6 +150,11 @@ func RunServer(addr, dbPath, model string) {
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.supabaseAuth == nil {
+			next(w, r)
+			return
+		}
+		// Local Qt GUI — same machine, session already established via CLI setup.
+		if s.isLocalRequest(r) && s.hasLocalSession() {
 			next(w, r)
 			return
 		}
@@ -146,7 +168,7 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, `{"error":"invalid authorization header"}`, http.StatusUnauthorized)
 			return
 		}
-		user, err := s.supabaseAuth.VerifyToken(parts[1])
+		user, err := s.verifyBearerToken(parts[1])
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusUnauthorized)
 			return
@@ -154,6 +176,28 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		ctx := auth.WithUser(r.Context(), user)
 		next(w, r.WithContext(ctx))
 	}
+}
+
+func (s *Server) isLocalRequest(r *http.Request) bool {
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return ip == "127.0.0.1" || ip == "::1"
+	}
+	return strings.HasPrefix(r.RemoteAddr, "127.0.0.1:") || strings.HasPrefix(r.RemoteAddr, "[::1]:")
+}
+
+func (s *Server) hasLocalSession() bool {
+	if s.db == nil {
+		return false
+	}
+	sess, err := s.db.GetAuthSession()
+	return err == nil && sess != nil && sess.AccessToken != ""
 }
 
 // ── HANDLERS ─────────────────────────────────────────────────────────────────
@@ -164,6 +208,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	LoadDotEnv()
 	s.authMu.RLock()
 	user := s.authUser
 	authenticated := s.authAccessToken != "" && user != nil
@@ -251,6 +296,17 @@ func (s *Server) handleTailscaleConnect(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, `{"error":"POST only"}`, http.StatusMethodNotAllowed)
 		return
 	}
+	if s.tailscale.IsRunning() {
+		ip, _ := s.tailscale.GetTailscaleIP()
+		magicDNS, _ := s.tailscale.GetMagicDNS()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":    "connected",
+			"ip":        ip,
+			"magic_dns": magicDNS,
+		})
+		return
+	}
 	var req struct {
 		AuthKey string `json:"auth_key"`
 	}
@@ -261,19 +317,30 @@ func (s *Server) handleTailscaleConnect(w http.ResponseWriter, r *http.Request) 
 	if req.AuthKey == "" {
 		req.AuthKey = os.Getenv("TAILSCALE_AUTH_KEY")
 	}
+	if req.AuthKey == "" {
+		http.Error(w, `{"error":"Tailscale not connected — run ./fotoro setup in a terminal"}`, http.StatusBadRequest)
+		return
+	}
 	if err := s.tailscale.Up(req.AuthKey, []string{"tag:fotoro"}); err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 	ip, _ := s.tailscale.GetTailscaleIP()
 	tailnet, _ := s.tailscale.GetTailnetName()
+	magicDNS, _ := s.tailscale.GetMagicDNS()
 	s.db.UpdateServerConfig(map[string]interface{}{
 		"tailscale_enabled": 1,
 		"tailscale_ip":      ip,
 		"tailnet_name":      tailnet,
+		"tailnet_url":       magicDNS,
 	})
+	go s.syncNodeToCloud()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "connected", "ip": ip})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "connected",
+		"ip":        ip,
+		"magic_dns": magicDNS,
+	})
 }
 
 func (s *Server) handleTailscaleDisconnect(w http.ResponseWriter, r *http.Request) {
@@ -304,6 +371,17 @@ func (s *Server) handleTailscaleInfo(w http.ResponseWriter, r *http.Request) {
 		"installed": s.tailscale.IsInstalled(),
 		"running":   s.tailscale.IsRunning(),
 	})
+}
+
+func (s *Server) runNodeHeartbeat() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !s.tailscale.IsRunning() {
+			continue
+		}
+		s.syncNodeToCloud()
+	}
 }
 
 func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
@@ -484,6 +562,9 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		page = 1
 	}
 	limit := 50
+	if perPage, err := strconv.Atoi(r.URL.Query().Get("per_page")); err == nil && perPage > 0 && perPage <= 200 {
+		limit = perPage
+	}
 	offset := (page - 1) * limit
 	orderBy := "id DESC"
 	if sortParam == "date" {
@@ -543,7 +624,7 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	hash := strings.TrimPrefix(r.URL.Path, "/api/thumbnail/")
 	size := r.URL.Query().Get("size")
 	if size == "" {
-		size = "small"
+		size = "medium"
 	}
 	if len(hash) < 2 {
 		http.Error(w, `{"error":"bad hash"}`, http.StatusBadRequest)
@@ -559,16 +640,76 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	var total, processed, failed int
+	var total, processed, failed, thumbs int
 	s.db.QueryRow("SELECT COUNT(*) FROM images").Scan(&total)
 	s.db.QueryRow("SELECT COUNT(*) FROM images WHERE category = 'failed'").Scan(&failed)
 	processed = total - failed
+
+	mediumDir := filepath.Join(s.cacheDir, "thumbnails", "medium")
+	_ = filepath.Walk(mediumDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && info != nil && !info.IsDir() && strings.HasSuffix(path, ".jpg") {
+			thumbs++
+		}
+		return nil
+	})
+
+	baseDir := filepath.Dir(s.cacheDir)
+	if baseDir == "" || baseDir == "." {
+		baseDir = "."
+	}
+	used := statsDirSizeBytes(filepath.Join(baseDir, ".cache")) + statsDirSizeBytes(filepath.Join(baseDir, "uploads"))
+
+	var diskTotal, diskFree uint64
+	if stat, err := statsDiskUsage(baseDir); err == nil {
+		diskTotal = stat.Total
+		diskFree = stat.Free
+	}
+
+	var deviceCount int
+	_ = s.db.QueryRow("SELECT COUNT(*) FROM mobile_devices WHERE is_active = 1").Scan(&deviceCount)
+	deviceCount++
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"total":     total,
-		"processed": processed,
-		"failed":    failed,
+		"total":              total,
+		"processed":          processed,
+		"failed":             failed,
+		"thumbnails_medium":  thumbs,
+		"storage_used_bytes": used,
+		"disk_total_bytes":   diskTotal,
+		"disk_free_bytes":    diskFree,
+		"devices_count":      deviceCount,
+		"people_count":       nil,
+		"places_count":       nil,
+		"ai_queue_pct":       nil,
 	})
+}
+
+type statsDiskStat struct {
+	Total uint64
+	Free  uint64
+}
+
+func statsDiskUsage(path string) (statsDiskStat, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return statsDiskStat{}, err
+	}
+	return statsDiskStat{
+		Total: st.Blocks * uint64(st.Bsize),
+		Free:  st.Bavail * uint64(st.Bsize),
+	}, nil
+}
+
+func statsDirSizeBytes(root string) int64 {
+	var size int64
+	_ = filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && info != nil && !info.IsDir() {
+			size += info.Size()
+		}
+		return nil
+	})
+	return size
 }
 
 func (s *Server) handleWebUpload(w http.ResponseWriter, r *http.Request) {

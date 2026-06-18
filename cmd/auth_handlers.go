@@ -30,28 +30,47 @@ func (s *Server) loadStoredSession() {
 }
 
 func (s *Server) handleAuthSetupPage(w http.ResponseWriter, r *http.Request) {
-	supabaseURL := os.Getenv("SUPABASE_URL")
-	supabaseAnon := os.Getenv("SUPABASE_ANON_KEY")
-	googleClientID := os.Getenv("GOOGLE_CLIENT_ID")
-	if supabaseURL == "" || supabaseAnon == "" {
-		http.Error(w, "Supabase is not configured. Set SUPABASE_URL and SUPABASE_ANON_KEY.", http.StatusServiceUnavailable)
-		return
-	}
-	origin := fmt.Sprintf("http://%s", r.Host)
-	html := authSetupHTML(supabaseURL, supabaseAnon, googleClientID, origin)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(html))
+	LoadDotEnv()
+	state := generateAuthState()
+	origin := requestOrigin(r)
+	cli := r.URL.Query().Get("cli") == "1"
+	http.Redirect(w, r, buildWebLoginURL(origin+"/auth/callback", state, cli), http.StatusTemporaryRedirect)
 }
 
 func (s *Server) handleAuthCallbackPage(w http.ResponseWriter, r *http.Request) {
+	LoadDotEnv()
+	q := r.URL.Query()
+	cliMode := q.Get("cli") == "1"
+
+	if access := q.Get("access_token"); access != "" {
+		state := q.Get("state")
+		if !validateAuthState(state) {
+			http.Error(w, "Invalid or expired sign-in session. Close this tab and run ./fotoro login again.", http.StatusBadRequest)
+			return
+		}
+		clearAuthState(state)
+		s.saveAuthFromCallback(
+			access,
+			q.Get("refresh_token"),
+			q.Get("user_id"),
+			q.Get("email"),
+			q.Get("name"),
+			q.Get("avatar_url"),
+		)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(buildWebAuthSuccessHTML(cliMode)))
+		return
+	}
+
+	// Fallback: Supabase OAuth code exchange (hash or ?code= from redirect)
 	supabaseURL := os.Getenv("SUPABASE_URL")
 	supabaseAnon := os.Getenv("SUPABASE_ANON_KEY")
 	if supabaseURL == "" || supabaseAnon == "" {
-		http.Error(w, "Supabase is not configured. Set SUPABASE_URL and SUPABASE_ANON_KEY.", http.StatusServiceUnavailable)
+		http.Error(w, "No session received. Your login page should redirect here with access_token and state query params.", http.StatusBadRequest)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(buildAuthCallbackHTML(supabaseURL, supabaseAnon)))
+	w.Write([]byte(buildAuthCallbackHTML(supabaseURL, supabaseAnon, cliMode)))
 }
 
 func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
@@ -62,6 +81,13 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 		user := s.authUser
 		token := s.authAccessToken
 		s.authMu.RUnlock()
+		if user == nil || token == "" {
+			s.loadStoredSession()
+			s.authMu.RLock()
+			user = s.authUser
+			token = s.authAccessToken
+			s.authMu.RUnlock()
+		}
 		if user == nil || token == "" {
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"authenticated": false,
@@ -183,161 +209,82 @@ func (s *Server) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.TailscaleAuthKey != "" {
-		_ = s.tailscale.Up(req.TailscaleAuthKey, []string{"tag:fotoro"})
+		if err := s.tailscale.Up(req.TailscaleAuthKey, []string{"tag:fotoro"}); err == nil {
+			ip, _ := s.tailscale.GetTailscaleIP()
+			tailnet, _ := s.tailscale.GetTailnetName()
+			magicDNS, _ := s.tailscale.GetMagicDNS()
+			s.db.UpdateServerConfig(map[string]interface{}{
+				"tailscale_enabled": 1,
+				"tailscale_ip":      ip,
+				"tailnet_name":      tailnet,
+				"tailnet_url":       magicDNS,
+			})
+			go s.syncNodeToCloud()
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-func authSetupHTML(supabaseURL, supabaseAnon, googleClientID, origin string) string {
-	oneTapBlock := ""
-	if googleClientID != "" {
-		oneTapBlock = fmt.Sprintf(`
-<div id="g_id_onload"
-  data-client_id="%s"
-  data-callback="handleGoogleCredential"
-  data-auto_prompt="true"
-  data-context="signin"
-  data-itp_support="true">
-</div>
-<div class="g_id_signin" data-type="standard" data-theme="filled_black" data-size="large" data-text="continue_with" data-shape="pill"></div>`,
-			googleClientID)
+func requestOrigin(r *http.Request) string {
+	host := r.Host
+	if strings.HasPrefix(host, "localhost:") {
+		host = "127.0.0.1" + strings.TrimPrefix(host, "localhost")
+	}
+	return "http://" + host
+}
+
+func buildAuthCallbackHTML(supabaseURL, supabaseAnon string, cliMode bool) string {
+	doneMsg := "Signed in. You can close this tab and return to Fotoro."
+	if cliMode {
+		doneMsg = "Signed in. Close this tab and return to your terminal."
 	}
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Fotoro — Sign in</title>
-<script src="https://accounts.google.com/gsi/client" async defer></script>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<title>Fotoro — Signed in</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    font-family: system-ui, -apple-system, Segoe UI, sans-serif;
-    background: #000; color: #f5f5f5; min-height: 100vh;
-    display: flex; align-items: center; justify-content: center;
-    background-image: radial-gradient(60%% 60%% at 50%% 0%%, hsl(0 0%% 100%% / 0.12), transparent 60%%);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: #0a0a0a; color: #f5f5f5; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center; padding: 24px;
   }
   .card {
-    width: min(420px, 92vw); background: #0d0d0d; border: 1px solid #242424;
-    border-radius: 16px; padding: 32px 28px; text-align: center;
-    box-shadow: inset 0 1px 0 hsl(0 0%% 100%% / 0.04), 0 1px 0 hsl(0 0%% 0%% / 0.4);
+    width: min(400px, 100%%); background: #111; border: 1px solid #2a2a2a;
+    border-radius: 20px; padding: 40px 32px; text-align: center;
   }
-  h1 { font-size: 1.35rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -0.02em; }
-  p { color: #9e9e9e; font-size: 0.92rem; line-height: 1.5; margin-bottom: 24px; }
-  .status { margin-top: 18px; font-size: 0.85rem; color: #9e9e9e; min-height: 1.2em; }
-  .status.ok { color: #f5f5f5; }
-  .status.err { color: #f5f5f5; }
-  button.oauth {
-    width: 100%%; height: 44px; border-radius: 8px; border: 1px solid #242424;
-    background: #f5f5f5; color: #0f0f0f; font-weight: 600; font-size: 0.95rem;
-    cursor: pointer; margin-top: 12px;
+  .spinner {
+    width: 32px; height: 32px; margin: 0 auto 20px;
+    border: 3px solid #333; border-top-color: #fff;
+    border-radius: 50%%; animation: spin 0.8s linear infinite;
   }
-  button.oauth:hover { background: #fff; }
-  .gsi-wrap { display: flex; justify-content: center; margin-top: 8px; min-height: 44px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  h1 { font-size: 1.2rem; font-weight: 600; margin-bottom: 10px; }
+  p { color: #888; font-size: 0.9rem; line-height: 1.5; }
+  p.ok { color: #ccc; }
+  p.err { color: #f87171; }
 </style>
 </head>
 <body>
 <div class="card">
-  <h1>Sign in to Fotoro</h1>
-  <p>Use your Google account to set up this installation. You only need to do this once.</p>
-  <div class="gsi-wrap">%s</div>
-  <button class="oauth" type="button" onclick="signInWithOAuth()">Continue with Google</button>
-  <div id="status" class="status">Waiting for Google sign-in…</div>
-</div>
-<script>
-const SUPABASE_URL = %q;
-const SUPABASE_ANON = %q;
-const REDIRECT = %q + '/auth/callback';
-const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
-
-function setStatus(msg, cls) {
-  const el = document.getElementById('status');
-  el.textContent = msg;
-  el.className = 'status' + (cls ? ' ' + cls : '');
-}
-
-async function persistSession(session) {
-  const user = session.user || {};
-  const meta = user.user_metadata || {};
-  const payload = {
-    access_token: session.access_token,
-    refresh_token: session.refresh_token,
-    user: {
-      id: user.id,
-      email: user.email,
-      name: meta.full_name || meta.name || user.email,
-      avatar_url: meta.avatar_url || meta.picture || ''
-    }
-  };
-  const res = await fetch('/api/auth/session', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  if (!res.ok) throw new Error('Could not save session');
-  setStatus('Signed in as ' + (user.email || 'your account') + '. You can return to Fotoro.', 'ok');
-}
-
-async function handleGoogleCredential(response) {
-  try {
-    setStatus('Signing in…');
-    const { data, error } = await supabase.auth.signInWithIdToken({
-      provider: 'google',
-      token: response.credential
-    });
-    if (error) throw error;
-    await persistSession(data.session);
-  } catch (e) {
-    setStatus(e.message || 'Sign-in failed', 'err');
-  }
-}
-
-async function signInWithOAuth() {
-  try {
-    setStatus('Opening Google…');
-    const { data, error } = await supabase.auth.signInWithOAuth({
-      provider: 'google',
-      options: { redirectTo: REDIRECT, skipBrowserRedirect: false }
-    });
-    if (error) throw error;
-    if (data && data.url) window.location.href = data.url;
-  } catch (e) {
-    setStatus(e.message || 'OAuth failed', 'err');
-  }
-}
-</script>
-</body>
-</html>`, oneTapBlock, supabaseURL, supabaseAnon, origin)
-}
-
-func buildAuthCallbackHTML(supabaseURL, supabaseAnon string) string {
-	return fmt.Sprintf(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<title>Fotoro — Signed in</title>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<style>
-  body { font-family: system-ui, sans-serif; background:#000; color:#f5f5f5;
-    min-height:100vh; display:flex; align-items:center; justify-content:center; }
-  .card { background:#0d0d0d; border:1px solid #242424; border-radius:16px; padding:32px; text-align:center; max-width:420px; }
-  p { color:#9e9e9e; margin-top:12px; }
-</style>
-</head>
-<body>
-<div class="card">
+  <div class="spinner" id="spin"></div>
   <h1>Completing sign-in…</h1>
   <p id="msg">Please wait.</p>
 </div>
-<script>
-const supabase = window.supabase.createClient(%q, %q);
+<script type="module">
+import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+
+const sb = createClient(%q, %q);
+const msg = document.getElementById('msg');
+const spin = document.getElementById('spin');
 
 async function saveSession(session) {
   const user = session.user || {};
   const meta = user.user_metadata || {};
-  await fetch('/api/auth/session', {
+  const res = await fetch('/api/auth/session', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -351,18 +298,17 @@ async function saveSession(session) {
       }
     })
   });
+  if (!res.ok) throw new Error('Could not save session to Fotoro');
 }
 
 async function finish() {
-  const msg = document.getElementById('msg');
   try {
     const hash = new URLSearchParams(window.location.hash.slice(1));
-    let access = hash.get('access_token');
-    let refresh = hash.get('refresh_token');
-    const query = new URLSearchParams(window.location.search);
-    const code = query.get('code');
+    const access = hash.get('access_token');
+    const refresh = hash.get('refresh_token');
+    const code = new URLSearchParams(window.location.search).get('code');
     if (code) {
-      const { data, error } = await supabase.auth.exchangeCodeForSession(code);
+      const { data, error } = await sb.auth.exchangeCodeForSession(code);
       if (error) throw error;
       await saveSession(data.session);
     } else if (access) {
@@ -376,21 +322,29 @@ async function finish() {
         })
       });
     } else {
-      msg.textContent = 'No session found. Close this tab and try again.';
-      return;
+      throw new Error('No session found in URL — try signing in again');
     }
-    msg.textContent = 'Signed in. You can close this tab and return to Fotoro.';
+    msg.textContent = %q;
+    msg.className = 'ok';
+    spin.style.display = 'none';
   } catch (e) {
-    msg.textContent = e.message || 'Sign-in failed';
+    msg.textContent = e?.message || String(e) || 'Sign-in failed';
+    msg.className = 'err';
+    spin.style.display = 'none';
   }
 }
+
 finish();
 </script>
 </body>
-</html>`, supabaseURL, supabaseAnon)
+</html>`, supabaseURL, supabaseAnon, doneMsg)
+}
+
+func authConfigured() bool {
+	return strings.TrimSpace(os.Getenv("SUPABASE_URL")) != "" &&
+		strings.TrimSpace(os.Getenv("SUPABASE_ANON_KEY")) != ""
 }
 
 func (s *Server) authConfigured() bool {
-	return strings.TrimSpace(os.Getenv("SUPABASE_URL")) != "" &&
-		strings.TrimSpace(os.Getenv("SUPABASE_ANON_KEY")) != ""
+	return authConfigured()
 }

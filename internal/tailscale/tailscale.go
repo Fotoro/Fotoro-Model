@@ -1,6 +1,7 @@
 package tailscale
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -41,6 +42,13 @@ func NewManager() *Manager {
 		config: Config{
 			NodeName: getEnv("FOTORO_NODE_NAME", "fotoro-server"),
 		},
+	}
+}
+
+// SetNodeName sets the MagicDNS hostname segment for this machine.
+func (m *Manager) SetNodeName(name string) {
+	if name != "" {
+		m.config.NodeName = name
 	}
 }
 
@@ -121,7 +129,28 @@ func (m *Manager) GetTailnetName() (string, error) {
 	return name, nil
 }
 
-// GenerateAuthKey creates a new auth key via Tailscale API
+// GetLoginName returns the Tailscale account email/name for this node.
+func (m *Manager) GetLoginName() (string, error) {
+	status, err := m.GetStatus()
+	if err != nil {
+		return "", err
+	}
+	users, ok := status["User"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("no user in status")
+	}
+	for _, v := range users {
+		userMap, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if name, ok := userMap["LoginName"].(string); ok && name != "" {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("no login name found")
+}
+
 func (m *Manager) GenerateAuthKey(apiKey string, reusable bool, ephemeral bool, tags []string) (string, error) {
 	if apiKey == "" {
 		apiKey = os.Getenv("TAILSCALE_API_KEY")
@@ -177,9 +206,50 @@ func (m *Manager) GenerateAuthKey(apiKey string, reusable bool, ephemeral bool, 
 	return result.Key, nil
 }
 
+// Logout removes this machine from the tailnet and clears local login state.
+func (m *Manager) Logout() error {
+	if !m.IsInstalled() {
+		return nil
+	}
+	cmd := exec.Command("sudo", "tailscale", "logout")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	_ = cmd.Run()
+	return m.Down()
+}
+
+// UpInteractive connects via Tailscale login URL (browser). No auth key required.
+// Pass forceReauth=true after a reset so the user must sign in again.
+func (m *Manager) UpInteractive(forceReauth bool) error {
+	args := []string{"up", "--accept-routes", "--reset", "--hostname=" + m.config.NodeName}
+	if forceReauth {
+		args = append(args, "--force-reauth")
+	}
+	cmd := exec.Command("sudo", append([]string{"tailscale"}, args...)...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	fmt.Println("[TAILSCALE] Sign in or create a free Tailscale account in your browser.")
+	fmt.Println("[TAILSCALE] (Google / Microsoft / GitHub / email — personal plan is free)")
+	fmt.Println("[TAILSCALE] Complete sign-in in the browser, then return here.")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("tailscale up failed: %w", err)
+	}
+
+	for i := 0; i < 120; i++ {
+		if m.IsRunning() {
+			ip, _ := m.GetTailscaleIP()
+			fmt.Printf("[TAILSCALE] Connected! IP: %s\n", ip)
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return fmt.Errorf("tailscale connection timeout after login")
+}
+
 // Up connects to tailnet with auth key
 func (m *Manager) Up(authKey string, tags []string) error {
-	args := []string{"up", "--auth-key=" + authKey, "--accept-routes", "--reset"}
+	args := []string{"up", "--auth-key=" + authKey, "--accept-routes", "--reset", "--hostname=" + m.config.NodeName}
 	if len(tags) > 0 {
 		args = append(args, "--advertise-tags="+strings.Join(tags, ","))
 	}
@@ -197,7 +267,7 @@ func (m *Manager) Up(authKey string, tags []string) error {
 	for i := 0; i < 30; i++ {
 		if m.IsRunning() {
 			ip, _ := m.GetTailscaleIP()
-			fmt.Printf("[TAILSCALE] Connected! IP: %s\\n", ip)
+			fmt.Printf("[TAILSCALE] Connected! IP: %s\n", ip)
 			return nil
 		}
 		time.Sleep(1 * time.Second)
@@ -210,18 +280,27 @@ func (m *Manager) SetupFunnel(localPort int) error {
 	if !m.IsRunning() {
 		return fmt.Errorf("tailscale not running")
 	}
-	
-	// Check if funnel is enabled in ACL
-	fmt.Printf("[TAILSCALE] Setting up Funnel on port %d...\\n", localPort)
-	
-	cmd := exec.Command("sudo", "tailscale", "funnel", fmt.Sprintf("%d", localPort), "--bg")
+
+	fmt.Printf("[TAILSCALE] Setting up Funnel on port %d...\n", localPort)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sudo", "tailscale", "funnel", "--bg", fmt.Sprintf("%d", localPort))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	
+
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			if m.ServeConfigured() {
+				m.config.FunnelEnabled = true
+				return nil
+			}
+			return fmt.Errorf("funnel setup timed out")
+		}
 		return fmt.Errorf("funnel setup failed: %w", err)
 	}
-	
+
 	m.config.FunnelEnabled = true
 	fmt.Println("[TAILSCALE] Funnel active — accessible from internet")
 	return nil
@@ -232,24 +311,83 @@ func (m *Manager) SetupServe(localPort int) error {
 	if !m.IsRunning() {
 		return fmt.Errorf("tailscale not running")
 	}
-	
-	cmd := exec.Command("sudo", "tailscale", "serve", "--bg", fmt.Sprintf("%d", localPort))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sudo", "tailscale", "serve", "--bg", fmt.Sprintf("%d", localPort))
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			if m.ServeConfigured() {
+				m.config.ServeEnabled = true
+				fmt.Println("[TAILSCALE] Serve active — accessible within tailnet")
+				return nil
+			}
+			return fmt.Errorf("serve setup timed out (is the API running on port %d?)", localPort)
+		}
 		return fmt.Errorf("serve setup failed: %w", err)
 	}
-	
+
 	m.config.ServeEnabled = true
 	fmt.Println("[TAILSCALE] Serve active — accessible within tailnet")
 	return nil
 }
 
-// GetMagicDNS returns the full DNS name
+// ServeConfigured reports whether tailscale serve has an active config.
+func (m *Manager) ServeConfigured() bool {
+	cmd := exec.Command("tailscale", "serve", "status", "--json")
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	var status map[string]interface{}
+	if json.Unmarshal(out, &status) != nil {
+		return false
+	}
+	// Empty config is {} or has no TCP/HTTP handlers
+	if len(status) == 0 {
+		return false
+	}
+	for k, v := range status {
+		if k == "TCP" || k == "Web" || k == "AllowFunnel" {
+			if m, ok := v.(map[string]interface{}); ok && len(m) > 0 {
+				return true
+			}
+		}
+	}
+	return len(status) > 0
+}
+
+// GetMagicDNS returns the full MagicDNS hostname (e.g. fotoro-server.tail650297.ts.net).
+// Uses Tailscale's Self.DNSName — never builds from the account email, because
+// emails contain "@" which breaks URLs in browsers.
 func (m *Manager) GetMagicDNS() (string, error) {
-	name, err := m.GetTailnetName()
+	status, err := m.GetStatus()
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s.%s.ts.net", m.config.NodeName, name), nil
+
+	if self, ok := status["Self"].(map[string]interface{}); ok {
+		if dns, ok := self["DNSName"].(string); ok && dns != "" {
+			return strings.TrimSuffix(dns, "."), nil
+		}
+	}
+
+	if ct, ok := status["CurrentTailnet"].(map[string]interface{}); ok {
+		if suffix, ok := ct["MagicDNSSuffix"].(string); ok && suffix != "" {
+			suffix = strings.TrimSuffix(suffix, ".")
+			host := m.config.NodeName
+			if host == "" {
+				host = "fotoro-server"
+			}
+			return host + "." + suffix, nil
+		}
+	}
+
+	return "", fmt.Errorf("no magic DNS name found")
 }
 
 // GetPublicURL returns the funnel URL if enabled
@@ -261,7 +399,7 @@ func (m *Manager) GetPublicURL() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return "https://" + magicDNS, nil
+	return PublicURL(magicDNS), nil
 }
 
 // GetTailnetURL returns the serve URL
@@ -273,7 +411,7 @@ func (m *Manager) GetTailnetURL() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return "https://" + magicDNS, nil
+	return PublicURL(magicDNS), nil
 }
 
 // RegisterWithOnlineDB sends the tailscale IP to your online service

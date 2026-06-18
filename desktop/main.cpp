@@ -71,7 +71,13 @@
 #include <cmath>
 #include <algorithm>
 
-static const QString BASE_URL = "http://127.0.0.1:8765";
+static QString baseURL() {
+    const QByteArray env = qgetenv("FOTORO_ADDR");
+    QString url = env.isEmpty() ? QStringLiteral("127.0.0.1:8765") : QString::fromUtf8(env);
+    if (!url.startsWith(QStringLiteral("http://")) && !url.startsWith(QStringLiteral("https://")))
+        url = QStringLiteral("http://") + url;
+    return url;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 //  FONT LOADING
@@ -1074,13 +1080,28 @@ protected:
 
 private slots:
     void beginGoogleSignIn() {
-        _authStatus->setText("Opening Google sign-in in your browser…");
-        QDesktopServices::openUrl(QUrl(BASE_URL + "/auth/setup"));
-        _authPoll->start();
-        pollAuthSession();
+        _authStatus->setText("Opening sign-in at fotoro.vercel.app…");
+        auto *reply = _net->get(QNetworkRequest(QUrl(baseURL() + "/api/auth/login-url?cli=1")));
+        connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+            if (reply->error() != QNetworkReply::NoError) {
+                _authStatus->setText("Could not get login URL — is the backend running?");
+                reply->deleteLater();
+                return;
+            }
+            auto obj = QJsonDocument::fromJson(reply->readAll()).object();
+            const QString loginUrl = obj.value("url").toString();
+            reply->deleteLater();
+            if (loginUrl.isEmpty()) {
+                _authStatus->setText("Invalid login URL from server.");
+                return;
+            }
+            QDesktopServices::openUrl(QUrl(loginUrl));
+            _authPoll->start();
+            pollAuthSession();
+        });
     }
     void pollAuthSession() {
-        auto *reply = _net->get(QNetworkRequest(QUrl(BASE_URL + "/api/auth/session")));
+        auto *reply = _net->get(QNetworkRequest(QUrl(baseURL() + "/api/auth/session")));
         connect(reply, &QNetworkReply::finished, this, [this, reply]() {
             if (reply->error() != QNetworkReply::NoError) {
                 reply->deleteLater();
@@ -1126,8 +1147,6 @@ private slots:
     }
     void completeSetup() {
         QJsonObject body;
-        if (_tailscaleKeyInput && !_tailscaleKeyInput->text().trimmed().isEmpty())
-            body["tailscale_auth_key"] = _tailscaleKeyInput->text().trimmed();
         if (_timeEdit)
             body["schedule_time"] = _timeEdit->time().toString("HH:mm");
         QStringList days;
@@ -1137,7 +1156,7 @@ private slots:
         if (!days.isEmpty()) body["schedule_days"] = days.join(",");
         QJsonDocument doc(body);
         auto *reply = _net->post(
-            apiRequest(QUrl(BASE_URL + "/api/setup/complete")),
+            apiRequest(QUrl(baseURL() + "/api/setup/complete")),
             doc.toJson());
         connect(reply, &QNetworkReply::finished, this, [this, reply]() {
             reply->deleteLater();
@@ -1181,22 +1200,36 @@ private:
         auto *page = new QWidget(this);
         auto *layout = new QVBoxLayout(page);
         layout->setSpacing(16);
-        auto *header = new QLabel("Connect Tailscale", page);
+        auto *header = new QLabel("Tailscale VPN", page);
         header->setFont(uiFont(14, QFont::DemiBold));
         header->setStyleSheet("color: " + Colors::textPrimary.name() + ";");
         layout->addWidget(header);
-        auto *desc = new QLabel("Tailscale creates a secure VPN between your phone and laptop. Your photos never leave your private network.", page);
+        auto *desc = new QLabel("Tailscale is configured during ./fotoro setup in your terminal. "
+            "It gives your phone secure access to this server over a private network.", page);
         desc->setFont(uiFont(11));
         desc->setStyleSheet("color: " + Colors::textSecondary.name() + ";");
         desc->setWordWrap(true);
         layout->addWidget(desc);
-        layout->addSpacing(8);
-        _tailscaleKeyInput = createStyledInput("Tailscale Auth Key (optional)");
-        layout->addWidget(_tailscaleKeyInput);
-        auto *hint = new QLabel("Leave empty to configure later. Get a key from login.tailscale.com", page);
-        hint->setFont(uiFont(9));
-        hint->setStyleSheet("color: " + Colors::textMuted.name() + ";");
-        layout->addWidget(hint);
+        _tailscaleStatus = new QLabel("Checking Tailscale status…", page);
+        _tailscaleStatus->setFont(uiFont(11));
+        _tailscaleStatus->setStyleSheet("color: " + Colors::textMuted.name() + ";");
+        _tailscaleStatus->setWordWrap(true);
+        layout->addWidget(_tailscaleStatus);
+        auto *tsReply = _net->get(apiRequest(QUrl(baseURL() + "/api/tailscale/info")));
+        connect(tsReply, &QNetworkReply::finished, this, [this, tsReply]() {
+            if (tsReply->error() == QNetworkReply::NoError) {
+                auto o = QJsonDocument::fromJson(tsReply->readAll()).object();
+                const QString ip = o.value("ip").toString();
+                const QString dns = o.value("magic_dns").toString();
+                if (!ip.isEmpty())
+                    _tailscaleStatus->setText("Connected — IP " + ip + "\n" + dns);
+                else
+                    _tailscaleStatus->setText("Not connected yet. Run ./fotoro setup in a terminal.");
+            } else {
+                _tailscaleStatus->setText("Run ./fotoro setup in a terminal to configure Tailscale.");
+            }
+            tsReply->deleteLater();
+        });
         layout->addStretch();
         return page;
     }
@@ -1313,7 +1346,8 @@ private:
     QStackedWidget *_pages;
     CircularButton *_backBtn, *_nextBtn, *_signInBtn;
     QLabel *_authStatus;
-    QLineEdit *_tailscaleKeyInput;
+    QLabel *_tailscaleStatus = nullptr;
+    QLineEdit *_tailscaleKeyInput = nullptr;
     QTimeEdit *_timeEdit;
     QVector<QCheckBox*> _dayChecks;
     QTimer *_authPoll = nullptr;
@@ -1441,7 +1475,7 @@ public:
 
 public slots:
     void refreshStatus() {
-        auto *reply = _net->get(QNetworkRequest(QUrl(BASE_URL + "/api/server/status")));
+        auto *reply = _net->get(apiRequest(QUrl(baseURL() + "/api/server/status")));
         connect(reply, &QNetworkReply::finished, this, [this, reply]() {
             if (reply->error() == QNetworkReply::NoError) {
                 auto obj = QJsonDocument::fromJson(reply->readAll()).object();
@@ -1454,7 +1488,7 @@ public slots:
             reply->deleteLater();
         });
 
-        auto *tsReply = _net->get(QNetworkRequest(QUrl(BASE_URL + "/api/tailscale/status")));
+        auto *tsReply = _net->get(apiRequest(QUrl(baseURL() + "/api/tailscale/status")));
         connect(tsReply, &QNetworkReply::finished, this, [this, tsReply]() {
             if (tsReply->error() == QNetworkReply::NoError) {
                 auto obj = QJsonDocument::fromJson(tsReply->readAll()).object();
@@ -1467,17 +1501,23 @@ public slots:
             tsReply->deleteLater();
         });
 
-        auto *tsInfoReply = _net->get(QNetworkRequest(QUrl(BASE_URL + "/api/tailscale/info")));
+        auto *tsInfoReply = _net->get(apiRequest(QUrl(baseURL() + "/api/tailscale/info")));
         connect(tsInfoReply, &QNetworkReply::finished, this, [this, tsInfoReply]() {
             if (tsInfoReply->error() == QNetworkReply::NoError) {
                 auto obj = QJsonDocument::fromJson(tsInfoReply->readAll()).object();
                 QString ip = obj.value("ip").toString();
-                _tsIP->setText(ip.isEmpty() ? "IP: --" : "IP: " + ip);
+                QString dns = obj.value("magic_dns").toString();
+                if (ip.isEmpty())
+                    _tsIP->setText("IP: —");
+                else if (dns.isEmpty())
+                    _tsIP->setText("IP: " + ip);
+                else
+                    _tsIP->setText("IP: " + ip + "\n" + dns);
             }
             tsInfoReply->deleteLater();
         });
 
-        auto *schedReply = _net->get(QNetworkRequest(QUrl(BASE_URL + "/api/scheduler/status")));
+        auto *schedReply = _net->get(apiRequest(QUrl(baseURL() + "/api/scheduler/status")));
         connect(schedReply, &QNetworkReply::finished, this, [this, schedReply]() {
             if (schedReply->error() == QNetworkReply::NoError) {
                 auto obj = QJsonDocument::fromJson(schedReply->readAll()).object();
@@ -1489,7 +1529,7 @@ public slots:
             schedReply->deleteLater();
         });
 
-        auto *memReply = _net->get(QNetworkRequest(QUrl(BASE_URL + "/api/system/memory")));
+        auto *memReply = _net->get(apiRequest(QUrl(baseURL() + "/api/system/memory")));
         connect(memReply, &QNetworkReply::finished, this, [this, memReply]() {
             if (memReply->error() == QNetworkReply::NoError) {
                 auto obj = QJsonDocument::fromJson(memReply->readAll()).object();
@@ -1504,7 +1544,7 @@ public slots:
     }
 
     void onStartServer() {
-        auto *reply = _net->post(QNetworkRequest(QUrl(BASE_URL + "/api/server/start")), QByteArray());
+        auto *reply = _net->post(apiRequest(QUrl(baseURL() + "/api/server/start")), QByteArray());
         connect(reply, &QNetworkReply::finished, this, [this, reply]() {
             reply->deleteLater();
             refreshStatus();
@@ -1512,7 +1552,7 @@ public slots:
     }
 
     void onStopServer() {
-        auto *reply = _net->post(QNetworkRequest(QUrl(BASE_URL + "/api/server/stop")), QByteArray());
+        auto *reply = _net->post(apiRequest(QUrl(baseURL() + "/api/server/stop")), QByteArray());
         connect(reply, &QNetworkReply::finished, this, [this, reply]() {
             reply->deleteLater();
             refreshStatus();
@@ -1520,26 +1560,21 @@ public slots:
     }
 
     void onConnectTailscale() {
-        bool ok;
-        QString authKey = QInputDialog::getText(this, "Tailscale Auth Key",
-            "Enter your Tailscale auth key:", QLineEdit::Password, "", &ok);
-        if (!ok || authKey.isEmpty()) return;
-
-        QJsonObject obj;
-        obj["auth_key"] = authKey;
-        QJsonDocument doc(obj);
-
         auto *reply = _net->post(
-            QNetworkRequest(QUrl(BASE_URL + "/api/tailscale/connect")),
-            doc.toJson());
+            apiRequest(QUrl(baseURL() + "/api/tailscale/connect")),
+            QByteArray("{}"));
         connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+            if (reply->error() != QNetworkReply::NoError) {
+                QMessageBox::information(this, "Tailscale",
+                    "Not connected. Run ./fotoro setup in a terminal to link Tailscale.");
+            }
             reply->deleteLater();
             refreshStatus();
         });
     }
 
     void onDisconnectTailscale() {
-        auto *reply = _net->post(QNetworkRequest(QUrl(BASE_URL + "/api/tailscale/disconnect")), QByteArray());
+        auto *reply = _net->post(apiRequest(QUrl(baseURL() + "/api/tailscale/disconnect")), QByteArray());
         connect(reply, &QNetworkReply::finished, this, [this, reply]() {
             reply->deleteLater();
             refreshStatus();
@@ -1547,7 +1582,7 @@ public slots:
     }
 
     void onRunScheduler() {
-        auto *reply = _net->post(QNetworkRequest(QUrl(BASE_URL + "/api/scheduler/run")), QByteArray());
+        auto *reply = _net->post(apiRequest(QUrl(baseURL() + "/api/scheduler/run")), QByteArray());
         connect(reply, &QNetworkReply::finished, this, [this, reply]() {
             auto obj = QJsonDocument::fromJson(reply->readAll()).object();
             reply->deleteLater();
@@ -1808,9 +1843,22 @@ public:
         _relayoutTimer->setSingleShot(true);
         _relayoutTimer->setInterval(55);
         connect(_relayoutTimer, &QTimer::timeout, [this](){ _masonry->relayout(); });
-        checkSetup();
-        fetchStats();
-        reloadGallery();
+        bootstrapFromServer();
+    }
+
+    void bootstrapFromServer() {
+        auto *reply = _net->get(QNetworkRequest(QUrl(baseURL() + "/api/auth/session")));
+        connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+            if (reply->error() == QNetworkReply::NoError) {
+                auto obj = QJsonDocument::fromJson(reply->readAll()).object();
+                const QString token = obj.value("access_token").toString();
+                if (!token.isEmpty()) saveAuthToken(token);
+            }
+            reply->deleteLater();
+            checkSetup();
+            fetchStats();
+            reloadGallery();
+        });
     }
     
 protected:
@@ -1867,7 +1915,7 @@ private slots:
     void checkSetup() {
         QSettings local("fotoro", "fotoro");
         if (local.value("setup/complete", false).toBool()) return;
-        auto *reply = _net->get(QNetworkRequest(QUrl(BASE_URL + "/api/setup/status")));
+        auto *reply = _net->get(QNetworkRequest(QUrl(baseURL() + "/api/setup/status")));
         connect(reply, &QNetworkReply::finished, this, [this, reply]() {
             bool showWizard = true;
             if (reply->error() == QNetworkReply::NoError) {
@@ -1876,7 +1924,7 @@ private slots:
                     QSettings("fotoro", "fotoro").setValue("setup/complete", true);
                     const QString token = loadAuthToken();
                     if (token.isEmpty()) {
-                        auto *sess = _net->get(QNetworkRequest(QUrl(BASE_URL + "/api/auth/session")));
+                        auto *sess = _net->get(QNetworkRequest(QUrl(baseURL() + "/api/auth/session")));
                         connect(sess, &QNetworkReply::finished, this, [sess]() {
                             if (sess->error() == QNetworkReply::NoError) {
                                 auto o = QJsonDocument::fromJson(sess->readAll()).object();
@@ -1899,7 +1947,7 @@ private slots:
         });
     }
     void fetchStats() {
-        auto *reply = _net->get(QNetworkRequest(QUrl(BASE_URL + "/api/stats")));
+        auto *reply = _net->get(apiRequest(QUrl(baseURL() + "/api/stats")));
         connect(reply, &QNetworkReply::finished, this, [this, reply](){
             if (reply->error() == QNetworkReply::NoError) {
                 auto obj = QJsonDocument::fromJson(reply->readAll()).object();
@@ -1932,7 +1980,7 @@ private slots:
     void loadFavorites() {
         if (_favorites.isEmpty()) { _statusLabel->setText("No favorites yet"); return; }
         _statusLabel->setText("Loading favorites...");
-        auto *reply = _net->get(QNetworkRequest(QUrl(BASE_URL + "/api/images?page=1&per_page=200")));
+        auto *reply = _net->get(apiRequest(QUrl(baseURL() + "/api/images?page=1&per_page=200")));
         connect(reply, &QNetworkReply::finished, this, [this, reply](){
             if (reply->error() == QNetworkReply::NoError) {
                 auto arr = QJsonDocument::fromJson(reply->readAll()).array();
@@ -1959,12 +2007,12 @@ private slots:
         if (_fetching) return;
         _fetching = true;
         _statusLabel->setText("Loading...");
-        QString url = QString("%1/api/images?page=%2&per_page=50").arg(BASE_URL).arg(page);
+        QString url = QString("%1/api/images?page=%2&per_page=50").arg(baseURL()).arg(page);
         if (!_activeCategory.isEmpty() && _activeCategory != "__favorites__" && _activeCategory != "timeline")
             url += "&category=" + QString::fromUtf8(QUrl::toPercentEncoding(_activeCategory));
         if (_activeCategory == "timeline")
             url += "&sort=date";
-        auto *reply = _net->get(QNetworkRequest(QUrl(url)));
+        auto *reply = _net->get(apiRequest(QUrl(url)));
         connect(reply, &QNetworkReply::finished, this, [this, reply](){
             _fetching = false;
             if (reply->error() != QNetworkReply::NoError) {
@@ -1997,8 +2045,8 @@ private slots:
         _page = 1; _totalFetched = 0;
         _masonry->clearCards();
         _statusLabel->setText("Searching...");
-        QString url = QString("%1/api/search?q=%2").arg(BASE_URL).arg(QString::fromUtf8(QUrl::toPercentEncoding(_activeQuery)));
-        auto *reply = _net->get(QNetworkRequest(QUrl(url)));
+        QString url = QString("%1/api/search?q=%2").arg(baseURL()).arg(QString::fromUtf8(QUrl::toPercentEncoding(_activeQuery)));
+        auto *reply = _net->get(apiRequest(QUrl(url)));
         connect(reply, &QNetworkReply::finished, this, [this, reply](){
             if (reply->error() != QNetworkReply::NoError) {
                 _statusLabel->setText("Search failed");
@@ -2045,7 +2093,7 @@ private slots:
     }
     void fetchThumbnail(ImageCard *card, const QString &path) {
         QPointer<ImageCard> safe = card;
-        auto *reply = _net->get(QNetworkRequest(QUrl(BASE_URL + path)));
+        auto *reply = _net->get(apiRequest(QUrl(baseURL() + path)));
         connect(reply, &QNetworkReply::finished, this, [this, reply, safe](){
             if (!safe) { reply->deleteLater(); return; }
             if (reply->error() == QNetworkReply::NoError) {
@@ -2068,7 +2116,7 @@ private slots:
         _lightbox->showLoading(d.caption);
         _lightbox->setGeometry(centralWidget()->rect());
         _lightbox->raise();
-        auto *reply = _net->get(QNetworkRequest(QUrl(BASE_URL + "/api/image/" + d.hash)));
+        auto *reply = _net->get(apiRequest(QUrl(baseURL() + "/api/image/" + d.hash)));
         connect(reply, &QNetworkReply::finished, this, [this, reply, d](){
             if (reply->error() == QNetworkReply::NoError) {
                 QPixmap pix;

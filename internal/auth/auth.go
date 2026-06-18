@@ -109,7 +109,7 @@ func (sa *SupabaseAuth) VerifyToken(tokenString string) (*User, error) {
 	claims := jwt.MapClaims{}
 	token, err = jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
 		return key, nil
-	}, jwt.WithIssuer(sa.supabaseURL+"/auth/v1"), jwt.WithValidMethods([]string{"RS256", "ES256"}))
+	}, jwt.WithIssuer(sa.supabaseURL+"/auth/v1"), jwt.WithValidMethods([]string{"RS256", "ES256"}), jwt.WithLeeway(120*time.Second))
 	if err != nil {
 		return nil, fmt.Errorf("verify token: %w", err)
 	}

@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -72,6 +73,7 @@ func (d *DB) ExtendedMigrate() error {
 		`ALTER TABLE server_config ADD COLUMN auth_user_avatar TEXT`,
 		`ALTER TABLE server_config ADD COLUMN schedule_time TEXT DEFAULT '02:00'`,
 		`ALTER TABLE server_config ADD COLUMN schedule_days TEXT DEFAULT '1,2,3,4,5'`,
+		`ALTER TABLE server_config ADD COLUMN tailnet_serve_url TEXT`,
 		`CREATE TABLE IF NOT EXISTS offline_cache (
 			id INTEGER PRIMARY KEY,
 			hash TEXT NOT NULL,
@@ -205,9 +207,9 @@ func (d *DB) GetUserByEmail(email string) (map[string]interface{}, error) {
 	var user struct {
 		ID        int
 		Email     string
-		Name      string
+		Name      sql.NullString
 		CreatedAt time.Time
-		LastLogin time.Time
+		LastLogin sql.NullTime
 		IsActive  int
 	}
 
@@ -220,14 +222,50 @@ func (d *DB) GetUserByEmail(email string) (map[string]interface{}, error) {
 		return nil, err
 	}
 
-	return map[string]interface{}{
+	out := map[string]interface{}{
 		"id":         user.ID,
 		"email":      user.Email,
-		"name":       user.Name,
 		"created_at": user.CreatedAt,
-		"last_login": user.LastLogin,
 		"is_active":  user.IsActive == 1,
-	}, nil
+	}
+	if user.Name.Valid {
+		out["name"] = user.Name.String
+	}
+	if user.LastLogin.Valid {
+		out["last_login"] = user.LastLogin.Time
+	}
+	return out, nil
+}
+
+// GetOrCreateUser returns an existing user by email or inserts a new row.
+func (d *DB) GetOrCreateUser(email, name, passwordHash string) (int64, error) {
+	if existing, err := d.GetUserByEmail(email); err == nil {
+		if id := mapUserID(existing); id > 0 {
+			return id, nil
+		}
+	}
+	id, err := d.CreateUser(email, name, passwordHash)
+	if err != nil && strings.Contains(err.Error(), "UNIQUE constraint") {
+		if existing, err2 := d.GetUserByEmail(email); err2 == nil {
+			if id := mapUserID(existing); id > 0 {
+				return id, nil
+			}
+		}
+	}
+	return id, err
+}
+
+func mapUserID(m map[string]interface{}) int64 {
+	switch v := m["id"].(type) {
+	case int:
+		return int64(v)
+	case int64:
+		return v
+	case float64:
+		return int64(v)
+	default:
+		return 0
+	}
 }
 
 func (d *DB) UpdateUserTailscale(userID int, ip, tailnet, nodeName string) error {
