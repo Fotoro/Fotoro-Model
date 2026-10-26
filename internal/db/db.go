@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"strings"
 
 	_ "modernc.org/sqlite"
@@ -13,6 +14,10 @@ type DB struct {
 }
 
 func Open(path string) (*DB, error) {
+	existing := false
+	if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+		existing = true
+	}
 	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -23,11 +28,9 @@ func Open(path string) (*DB, error) {
 	db.SetMaxIdleConns(1)
 
 	d := &DB{db}
-	if err := d.Migrate(); err != nil {
-		return nil, fmt.Errorf("migrate: %w", err)
-	}
-	if err := d.ExtendedMigrate(); err != nil {
-		return nil, fmt.Errorf("extended migrate: %w", err)
+	if err := d.migrateVersioned(path, existing); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return d, nil
 }

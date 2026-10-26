@@ -172,9 +172,11 @@ func RunServer(addr, dbPath, model string) {
 	registerGalleryRoutes(mux, s)
 	registerMediaV1Routes(mux, s)
 	registerStorageRoutes(mux, s)
+	registerDiagnosticsRoutes(mux, s)
 
 	fmt.Printf("[SERVER] Running on %s\\n", addr)
 	queue.StartDaemon(model)
+	s.startDerivativeWorker()
 	s.startBackupWorker()
 	go ensureTailscaleExpose(s, addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {

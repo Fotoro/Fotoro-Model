@@ -24,6 +24,18 @@ type BackupStatus struct {
 	Failed     int    `json:"failed"`
 }
 
+type PrimaryStatus struct {
+	Available bool   `json:"available"`
+	Error     string `json:"error,omitempty"`
+}
+
+func (s *Service) PrimaryStatus() PrimaryStatus {
+	if err := s.primaryAvailable(); err != nil {
+		return PrimaryStatus{Error: err.Error()}
+	}
+	return PrimaryStatus{Available: true}
+}
+
 func syncFile(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -57,7 +69,49 @@ func filesystemDevice(path string) (uint64, error) {
 	return uint64(st.Dev), nil
 }
 
+func validateMount(storageRoot, mountDir string, deviceForPath func(string) (uint64, error)) error {
+	root, err := filepath.Abs(storageRoot)
+	if err != nil {
+		return err
+	}
+	mount, err := filepath.Abs(mountDir)
+	if err != nil {
+		return err
+	}
+	if mount == string(filepath.Separator) {
+		return fmt.Errorf("filesystem root is not a dedicated storage mount")
+	}
+	rel, err := filepath.Rel(mount, root)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("storage directory is outside its configured mount")
+	}
+	mountedDevice, err := deviceForPath(mount)
+	if err != nil {
+		return err
+	}
+	parentDevice, err := deviceForPath(filepath.Dir(mount))
+	if err != nil {
+		return err
+	}
+	if mountedDevice == parentDevice {
+		return fmt.Errorf("configured storage mount is not mounted")
+	}
+	rootDevice, err := deviceForPath(root)
+	if err != nil {
+		return err
+	}
+	if rootDevice != mountedDevice {
+		return fmt.Errorf("storage directory is on a different filesystem than its mount")
+	}
+	return nil
+}
+
 func (s *Service) primaryAvailable() error {
+	if s.primaryMount != "" {
+		if err := validateMount(s.storageRoot, s.primaryMount, s.deviceForPath); err != nil {
+			return fmt.Errorf("primary mount: %w", err)
+		}
+	}
 	device, err := s.deviceForPath(s.storageRoot)
 	if err != nil {
 		return fmt.Errorf("primary storage unavailable: %w", err)
@@ -74,6 +128,9 @@ func (s *Service) backupAvailable() error {
 	}
 	if err := s.primaryAvailable(); err != nil {
 		return err
+	}
+	if err := validateMount(s.backupRoot, s.backupMount, s.deviceForPath); err != nil {
+		return fmt.Errorf("secondary mount: %w", err)
 	}
 	primary := s.primaryDevice
 	var err error
@@ -167,6 +224,12 @@ func (s *Service) VerifyPrimaryPending(ctx context.Context, limit int) (int, err
 	for _, c := range candidates {
 		if err := ctx.Err(); err != nil {
 			return verified, err
+		}
+		device, err := s.deviceForPath(filepath.Dir(c.path))
+		if err != nil || device != s.primaryDevice {
+			_, _ = s.db.Exec(`UPDATE media_assets SET status = 'missing', checksum_verified = 0,
+				updated_at = ? WHERE id = ?`, time.Now().UTC(), c.id)
+			continue
 		}
 		actual, err := hashFile(c.path)
 		if err != nil {
@@ -324,6 +387,10 @@ func (s *Service) backupOne(id, expectedHash, source, originalName string) error
 	}
 	if !isSHA256(expectedHash) {
 		return fmt.Errorf("invalid asset hash")
+	}
+	device, err := s.deviceForPath(filepath.Dir(source))
+	if err != nil || device != s.primaryDevice {
+		return fmt.Errorf("primary original is not on the configured primary filesystem")
 	}
 	actual, err := hashFile(source)
 	if err != nil || !strings.EqualFold(actual, expectedHash) {

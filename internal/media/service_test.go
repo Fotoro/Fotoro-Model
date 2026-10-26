@@ -4,6 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,6 +28,30 @@ func newTestService(t *testing.T) *Service {
 		t.Fatal(err)
 	}
 	return s
+}
+
+func TestBackupMountMustRemainIndependent(t *testing.T) {
+	s := newTestService(t)
+	backup := filepath.Join(t.TempDir(), "mounted", "library")
+	if err := os.MkdirAll(backup, 0700); err != nil {
+		t.Fatal(err)
+	}
+	s.backupRoot = backup
+	s.backupMount = filepath.Dir(backup)
+	s.backupDevice = s.primaryDevice + 1
+	s.deviceForPath = func(path string) (uint64, error) {
+		if strings.HasPrefix(path, s.backupMount) {
+			return s.backupDevice, nil
+		}
+		return s.primaryDevice, nil
+	}
+	if err := s.backupAvailable(); err != nil {
+		t.Fatalf("mounted secondary should be available: %v", err)
+	}
+	s.deviceForPath = func(string) (uint64, error) { return s.primaryDevice, nil }
+	if err := s.backupAvailable(); err == nil {
+		t.Fatal("an unmounted secondary was accepted")
+	}
 }
 
 func TestResumableUploadAndBackup(t *testing.T) {
@@ -71,6 +98,7 @@ func TestResumableUploadAndBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.backupRoot = backup
+	s.backupMount = backup
 	s.backupDevice = s.primaryDevice + 1
 	s.deviceForPath = func(path string) (uint64, error) {
 		if strings.HasPrefix(path, backup) {
@@ -153,5 +181,46 @@ func TestLegacyRowRequiresRealPrimaryVerification(t *testing.T) {
 	asset, err = s.GetAsset(hash)
 	if err != nil || asset.FileSize != int64(len(contents)) || asset.StorageCopies != 1 {
 		t.Fatalf("legacy reconciliation: asset=%+v err=%v", asset, err)
+	}
+}
+
+func TestThumbnailJobRunsAfterDurableImport(t *testing.T) {
+	s := newTestService(t)
+	path := filepath.Join(t.TempDir(), "camera.png")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := image.NewRGBA(image.Rect(0, 0, 32, 32))
+	for y := 0; y < 32; y++ {
+		for x := 0; x < 32; x++ {
+			img.Set(x, y, color.RGBA{R: uint8(x * 8), G: uint8(y * 8), A: 255})
+		}
+	}
+	if err := png.Encode(f, img); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	result, err := s.ImportFile(path, ImportOptions{OriginalName: "camera.png"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Asset.PreviewStatus != "pending" || result.Asset.ThumbnailURL != "" {
+		t.Fatalf("upload acknowledgement waited for preview: %+v", result.Asset)
+	}
+	processed, err := s.ProcessDerivativeJobs(context.Background(), 1)
+	if err != nil || processed != 1 {
+		t.Fatalf("thumbnail job: processed=%d err=%v", processed, err)
+	}
+	asset, err := s.GetAsset(result.Asset.ID)
+	if err != nil || asset.PreviewStatus != "ready" || asset.ThumbnailURL == "" {
+		t.Fatalf("thumbnail unavailable: asset=%+v err=%v", asset, err)
+	}
+	thumb, err := s.ThumbnailPath(asset.ID, "small")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(thumb); err != nil {
+		t.Fatal(err)
 	}
 }

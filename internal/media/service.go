@@ -37,6 +37,8 @@ type Service struct {
 	db            *db.DB
 	storageRoot   string
 	backupRoot    string
+	primaryMount  string
+	backupMount   string
 	primaryDevice uint64
 	backupDevice  uint64
 	deviceForPath func(string) (uint64, error)
@@ -44,6 +46,7 @@ type Service struct {
 	maxSize       int64
 	uploadLocks   sync.Map
 	backupMu      sync.Mutex
+	derivativeMu  sync.Mutex
 }
 
 type Asset struct {
@@ -132,6 +135,12 @@ func NewService(database *db.DB, dbPath string) (*Service, error) {
 		return nil, fmt.Errorf("primary storage must exist before server startup: %w", err)
 	}
 	backupRoot := strings.TrimSpace(os.Getenv("FOTORO_BACKUP_DIR"))
+	primaryMount := strings.TrimSpace(os.Getenv("FOTORO_PRIMARY_MOUNT_DIR"))
+	if primaryMount != "" {
+		if err := validateMount(storageRoot, primaryMount, filesystemDevice); err != nil {
+			return nil, fmt.Errorf("primary mount: %w", err)
+		}
+	}
 	var backupDevice uint64
 	if backupRoot != "" {
 		if !filepath.IsAbs(backupRoot) {
@@ -145,6 +154,15 @@ func NewService(database *db.DB, dbPath string) (*Service, error) {
 			return nil, fmt.Errorf("secondary storage must use a different filesystem")
 		}
 	}
+	backupMount := strings.TrimSpace(os.Getenv("FOTORO_BACKUP_MOUNT_DIR"))
+	if backupRoot != "" {
+		if backupMount == "" {
+			return nil, fmt.Errorf("FOTORO_BACKUP_MOUNT_DIR is required with FOTORO_BACKUP_DIR")
+		}
+		if err := validateMount(backupRoot, backupMount, filesystemDevice); err != nil {
+			return nil, fmt.Errorf("secondary mount: %w", err)
+		}
+	}
 	maxSize := DefaultMaxAssetSize
 	if raw := strings.TrimSpace(os.Getenv("FOTORO_MAX_ASSET_BYTES")); raw != "" {
 		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
@@ -155,6 +173,8 @@ func NewService(database *db.DB, dbPath string) (*Service, error) {
 		db:            database,
 		storageRoot:   storageRoot,
 		backupRoot:    backupRoot,
+		primaryMount:  primaryMount,
+		backupMount:   backupMount,
 		primaryDevice: primaryDevice,
 		backupDevice:  backupDevice,
 		deviceForPath: filesystemDevice,
@@ -214,6 +234,12 @@ func (s *Service) ImportFile(sourcePath string, opts ImportOptions) (*ImportResu
 		}
 		if err := s.linkDeviceAsset(existing.ID, opts, info.Size(), hash); err != nil {
 			return nil, err
+		}
+		if existing.MediaKind == "image" && existing.PreviewStatus == "pending" {
+			if _, err := s.db.Exec(`INSERT OR IGNORE INTO analysis_jobs
+				(media_asset_id, job_type, status) VALUES (?, 'thumbnail', 'pending')`, existing.ID); err != nil {
+				return nil, err
+			}
 		}
 		existing, err = s.GetAsset(existing.ID)
 		if err != nil {
@@ -291,7 +317,11 @@ func (s *Service) ImportFile(sourcePath string, opts ImportOptions) (*ImportResu
 	}
 
 	if kind == "image" {
-		s.generateImageDerivatives(hash, destination, mimeType, name, now)
+		syncLegacyImage(s.db, hash, destination, mimeType, name, nil, now)
+		if _, err := s.db.Exec(`INSERT OR IGNORE INTO analysis_jobs
+			(media_asset_id, job_type, status) VALUES (?, 'thumbnail', 'pending')`, hash); err != nil {
+			return nil, err
+		}
 	} else {
 		_, _ = s.db.Exec(`UPDATE media_assets SET preview_status = 'unavailable', updated_at = ? WHERE id = ?`, now, hash)
 	}
@@ -303,17 +333,17 @@ func (s *Service) ImportFile(sourcePath string, opts ImportOptions) (*ImportResu
 	return &ImportResult{Asset: asset}, nil
 }
 
-func (s *Service) generateImageDerivatives(id, path, mimeType, name string, now time.Time) {
+func (s *Service) generateImageDerivatives(id, path, mimeType, name string, now time.Time) error {
 	meta, err := validate.PrepareImage(path)
 	if err != nil {
 		_, _ = s.db.Exec(`UPDATE media_assets SET preview_status = 'unavailable', updated_at = ? WHERE id = ?`, now, id)
 		syncLegacyImage(s.db, id, path, mimeType, name, nil, now)
-		return
+		return err
 	}
 	if err := validate.SaveThumbnails(s.cacheDir, meta); err != nil {
 		_, _ = s.db.Exec(`UPDATE media_assets SET preview_status = 'failed', updated_at = ? WHERE id = ?`, now, id)
 		syncLegacyImage(s.db, id, path, mimeType, name, meta, now)
-		return
+		return err
 	}
 	var captured interface{}
 	if !meta.TakenAt.IsZero() {
@@ -336,6 +366,7 @@ func (s *Service) generateImageDerivatives(id, path, mimeType, name string, now 
 		`, id, "thumbnail_"+size, thumbPath, thumbInfo.Size(), now)
 	}
 	syncLegacyImage(s.db, id, path, mimeType, name, meta, now)
+	return nil
 }
 
 func syncLegacyImage(database *db.DB, hash, path, mimeType, name string, meta *validate.ImageMeta, now time.Time) {

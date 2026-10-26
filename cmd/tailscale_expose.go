@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,7 +34,26 @@ func ensureTailscaleExpose(s *Server, addr string) {
 	}
 
 	port := fotoroServePort()
-	fmt.Printf("[TAILSCALE] Exposing API on your tailnet (port %d)…\n", port)
+	if os.Getenv("FOTORO_PRIVATE_SITE") == "1" {
+		port = 3000
+		if raw := strings.TrimSpace(os.Getenv("FOTORO_SITE_PORT")); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed < 65536 {
+				port = parsed
+			}
+		}
+		siteHealth := fmt.Sprintf("http://127.0.0.1:%d/api/v1/health", port)
+		deadline := time.Now().Add(time.Minute)
+		for !reachable(siteHealth) && time.Now().Before(deadline) {
+			time.Sleep(time.Second)
+		}
+		if !reachable(siteHealth) {
+			fmt.Printf("[WARN] Private website is not ready at %s — skipping tailscale serve\n", siteHealth)
+			return
+		}
+		fmt.Printf("[TAILSCALE] Exposing website and API on your tailnet (port %d)…\n", port)
+	} else {
+		fmt.Printf("[TAILSCALE] Exposing API on your tailnet (port %d)…\n", port)
+	}
 
 	publicURL := ""
 	tailnetURL := ""
