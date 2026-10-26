@@ -114,6 +114,126 @@ func (d *DB) ExtendedMigrate() error {
 			added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (album_id, hash)
 		)`,
+		`CREATE TABLE IF NOT EXISTS media_assets (
+			id TEXT PRIMARY KEY,
+			hash TEXT UNIQUE NOT NULL,
+			original_name TEXT NOT NULL DEFAULT '',
+			storage_path TEXT NOT NULL,
+			media_kind TEXT NOT NULL DEFAULT 'other',
+			mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+			file_size INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'verified',
+			captured_at DATETIME,
+			imported_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			width INTEGER,
+			height INTEGER,
+			duration_ms INTEGER,
+			checksum_verified INTEGER NOT NULL DEFAULT 0,
+			preview_status TEXT NOT NULL DEFAULT 'pending',
+			source_device_id TEXT,
+			device_asset_id TEXT,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(source_device_id, device_asset_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_media_assets_imported ON media_assets(imported_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_media_assets_kind ON media_assets(media_kind)`,
+		`CREATE INDEX IF NOT EXISTS idx_media_assets_captured ON media_assets(captured_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS device_assets (
+			device_id TEXT NOT NULL,
+			device_asset_id TEXT NOT NULL,
+			media_asset_id TEXT,
+			original_name TEXT,
+			local_uri TEXT,
+			file_size INTEGER NOT NULL DEFAULT 0,
+			sha256 TEXT,
+			sync_status TEXT NOT NULL DEFAULT 'discovered',
+			verified_at DATETIME,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (device_id, device_asset_id),
+			FOREIGN KEY (media_asset_id) REFERENCES media_assets(id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_device_assets_status ON device_assets(device_id, sync_status)`,
+		`CREATE TABLE IF NOT EXISTS upload_sessions (
+			id TEXT PRIMARY KEY,
+			owner_id TEXT NOT NULL,
+			device_id TEXT,
+			device_asset_id TEXT,
+			original_name TEXT NOT NULL,
+			mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+			expected_size INTEGER NOT NULL,
+			expected_sha256 TEXT,
+			received_size INTEGER NOT NULL DEFAULT 0,
+			temp_path TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'uploading',
+			media_asset_id TEXT,
+			error_message TEXT,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			expires_at DATETIME NOT NULL,
+			FOREIGN KEY (media_asset_id) REFERENCES media_assets(id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_upload_sessions_owner ON upload_sessions(owner_id, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_upload_sessions_expiry ON upload_sessions(expires_at)`,
+		`CREATE TABLE IF NOT EXISTS derivatives (
+			id INTEGER PRIMARY KEY,
+			media_asset_id TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			storage_path TEXT NOT NULL,
+			mime_type TEXT NOT NULL,
+			width INTEGER,
+			height INTEGER,
+			file_size INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(media_asset_id, kind),
+			FOREIGN KEY (media_asset_id) REFERENCES media_assets(id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS analysis_jobs (
+			id INTEGER PRIMARY KEY,
+			media_asset_id TEXT NOT NULL,
+			job_type TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'deferred',
+			error_message TEXT,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(media_asset_id, job_type),
+			FOREIGN KEY (media_asset_id) REFERENCES media_assets(id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS storage_copies (
+			id INTEGER PRIMARY KEY,
+			media_asset_id TEXT NOT NULL,
+			storage_name TEXT NOT NULL,
+			storage_path TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'verified',
+			checksum_verified INTEGER NOT NULL DEFAULT 0,
+			verified_at DATETIME,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(media_asset_id, storage_name),
+			FOREIGN KEY (media_asset_id) REFERENCES media_assets(id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS device_credentials (
+			device_id TEXT PRIMARY KEY,
+			owner_id TEXT NOT NULL DEFAULT '',
+			token_hash TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			platform TEXT NOT NULL,
+			scopes TEXT NOT NULL DEFAULT 'media:read,media:write',
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			last_used_at DATETIME,
+			revoked_at DATETIME
+		)`,
+		`ALTER TABLE device_credentials ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''`,
+		`CREATE TABLE IF NOT EXISTS pairing_sessions (
+			id TEXT PRIMARY KEY,
+			secret_hash TEXT UNIQUE NOT NULL,
+			created_by TEXT NOT NULL,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			expires_at DATETIME NOT NULL,
+			used_at DATETIME,
+			device_id TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pairing_sessions_expiry ON pairing_sessions(expires_at)`,
 	}
 
 	for _, stmt := range stmts {
@@ -126,6 +246,32 @@ func (d *DB) ExtendedMigrate() error {
 			}
 			return fmt.Errorf("extended migrate: %q: %w", stmt[:50], err)
 		}
+	}
+	// Existing paired devices remain linked to the account used during setup.
+	if _, err := d.Exec(`UPDATE device_credentials SET owner_id =
+		(SELECT COALESCE(auth_user_id, '') FROM server_config WHERE id = 1)
+		WHERE owner_id = ''`); err != nil {
+		return fmt.Errorf("link existing devices: %w", err)
+	}
+
+	// Existing image libraries remain available through the canonical media API.
+	// Paths are preserved; newly uploaded assets are copied into library/originals.
+	_, err := d.Exec(`
+		INSERT OR IGNORE INTO media_assets (
+			id, hash, original_name, storage_path, media_kind, mime_type, file_size,
+			status, captured_at, imported_at, checksum_verified, preview_status,
+			created_at, updated_at
+		)
+		SELECT hash, hash, path, path, 'image',
+			CASE WHEN content_type IS NULL OR content_type = '' OR content_type = 'unknown'
+				THEN 'image/jpeg' ELSE content_type END,
+			0, CASE WHEN category = 'failed' THEN 'stored' ELSE 'verified' END,
+			taken_at, COALESCE(processed_at, created_at), 1, 'ready',
+			created_at, COALESCE(processed_at, created_at)
+		FROM images
+	`)
+	if err != nil {
+		return fmt.Errorf("backfill media assets: %w", err)
 	}
 	return nil
 }
@@ -142,6 +288,7 @@ func (d *DB) GetServerConfig() (map[string]interface{}, error) {
 		ServeEnabled     int
 		PublicURL        string
 		TailnetURL       string
+		TailnetServeURL  string
 		OnlineDBEndpoint string
 		OnlineDBToken    string
 	}
@@ -149,11 +296,11 @@ func (d *DB) GetServerConfig() (map[string]interface{}, error) {
 	err := d.QueryRow(`
 		SELECT setup_complete, setup_step, server_name, tailscale_enabled, tailscale_ip,
 		       tailnet_name, funnel_enabled, serve_enabled, public_url, tailnet_url,
-		       online_db_endpoint, online_db_token
+		       COALESCE(tailnet_serve_url, ''), online_db_endpoint, online_db_token
 		FROM server_config WHERE id = 1
 	`).Scan(&cfg.SetupComplete, &cfg.SetupStep, &cfg.ServerName, &cfg.TailscaleEnabled,
 		&cfg.TailscaleIP, &cfg.TailnetName, &cfg.FunnelEnabled, &cfg.ServeEnabled,
-		&cfg.PublicURL, &cfg.TailnetURL, &cfg.OnlineDBEndpoint, &cfg.OnlineDBToken)
+		&cfg.PublicURL, &cfg.TailnetURL, &cfg.TailnetServeURL, &cfg.OnlineDBEndpoint, &cfg.OnlineDBToken)
 
 	if err != nil {
 		return nil, err
@@ -170,6 +317,7 @@ func (d *DB) GetServerConfig() (map[string]interface{}, error) {
 		"serve_enabled":      cfg.ServeEnabled == 1,
 		"public_url":         cfg.PublicURL,
 		"tailnet_url":        cfg.TailnetURL,
+		"tailnet_serve_url":  cfg.TailnetServeURL,
 		"online_db_endpoint": cfg.OnlineDBEndpoint,
 	}, nil
 }

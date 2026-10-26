@@ -18,25 +18,31 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"fotoro/internal/auth"
 	"fotoro/internal/db"
+	"fotoro/internal/media"
 	"fotoro/internal/ollama"
+	"fotoro/internal/scheduler"
 	"fotoro/internal/search"
 	"fotoro/internal/system"
 	"fotoro/internal/tailscale"
 )
 
 type Server struct {
-	db           *db.DB
-	cacheDir     string
-	ollama       *ollama.Client
-	embed        *ollama.EmbedClient
-	index        *search.Index
-	supabaseAuth *auth.SupabaseAuth
-	tailscale    *tailscale.Manager
-	serverMu     sync.RWMutex
-	running      bool
+	db               *db.DB
+	cacheDir         string
+	ollama           *ollama.Client
+	embed            *ollama.EmbedClient
+	index            *search.Index
+	queue            *scheduler.JobQueue
+	media            *media.Service
+	supabaseAuth     *auth.SupabaseAuth
+	tailscale        *tailscale.Manager
+	model            string
+	serverMu         sync.RWMutex
+	running          bool
 	authMu           sync.RWMutex
 	authAccessToken  string
 	authRefreshToken string
@@ -53,6 +59,25 @@ func RunServer(addr, dbPath, model string) {
 		panic(err)
 	}
 	defer database.Close()
+
+	queue := scheduler.NewJobQueue(database, scheduler.ScheduleConfig{
+		Enabled:            false,
+		ProcessTime:        "02:00",
+		MaxConcurrent:      1,
+		MaxPerBatch:        25,
+		ProcessScreenshots: true,
+		ProcessDocuments:   true,
+		ProcessPhotos:      true,
+	})
+	if err := queue.InitDB(); err != nil {
+		fmt.Printf("[WARN] Queue init failed: %v\\n", err)
+	} else if err := queue.LoadConfig(); err != nil {
+		fmt.Printf("[WARN] Queue config load failed: %v\\n", err)
+	}
+	mediaService, err := media.NewService(database, dbPath)
+	if err != nil {
+		panic(fmt.Errorf("media service: %w", err))
+	}
 
 	supabaseURL := os.Getenv("SUPABASE_URL")
 	supabaseAnon := os.Getenv("SUPABASE_ANON_KEY")
@@ -90,8 +115,11 @@ func RunServer(addr, dbPath, model string) {
 		ollama:       ollama.NewClient("", model),
 		embed:        ollama.NewEmbedClient(),
 		index:        idx,
+		queue:        queue,
+		media:        mediaService,
 		supabaseAuth: supabaseAuth,
 		tailscale:    tailscale.NewManager(),
+		model:        model,
 	}
 	s.loadStoredSession()
 
@@ -106,15 +134,16 @@ func RunServer(addr, dbPath, model string) {
 
 	mux := http.NewServeMux()
 
-	// Public
+	// Public health probe. Setup and local-session endpoints are deliberately
+	// loopback-only; they must never be reachable through a reverse proxy.
 	mux.HandleFunc("/api/health", s.handleHealth)
-	mux.HandleFunc("/api/auth/status", s.handleAuthStatus)
-	mux.HandleFunc("/api/auth/session", s.handleAuthSession)
-	mux.HandleFunc("/api/auth/login-url", s.handleAuthLoginURL)
-	mux.HandleFunc("/api/setup/status", s.handleSetupStatus)
-	mux.HandleFunc("/auth/setup", s.handleAuthSetupPage)
-	mux.HandleFunc("/auth/callback", s.handleAuthCallbackPage)
-	mux.HandleFunc("/api/setup/complete", s.handleSetupComplete)
+	mux.HandleFunc("/api/auth/status", s.localOnly(s.handleAuthStatus))
+	mux.HandleFunc("/api/auth/session", s.localOnly(s.handleAuthSession))
+	mux.HandleFunc("/api/auth/login-url", s.localOnly(s.handleAuthLoginURL))
+	mux.HandleFunc("/api/setup/status", s.localOnly(s.handleSetupStatus))
+	mux.HandleFunc("/auth/setup", s.localOnly(s.handleAuthSetupPage))
+	mux.HandleFunc("/auth/callback", s.localOnly(s.handleAuthCallbackPage))
+	mux.HandleFunc("/api/setup/complete", s.localOnly(s.handleSetupComplete))
 
 	// Auth required
 	mux.HandleFunc("/api/auth/me", s.withAuth(s.handleMe))
@@ -134,13 +163,19 @@ func RunServer(addr, dbPath, model string) {
 	mux.HandleFunc("/api/stats", s.withAuth(s.handleStats))
 	mux.HandleFunc("/api/web/upload", s.withAuth(s.handleWebUpload))
 	mux.HandleFunc("/api/web/upload/status", s.withAuth(s.handleUploadStatus))
+	mux.HandleFunc("/api/ingest/folder", s.withAuth(s.handleIngestFolder))
 	mux.HandleFunc("/api/scheduler/run", s.withAuth(s.handleSchedulerRun))
 	mux.HandleFunc("/api/scheduler/status", s.withAuth(s.handleSchedulerStatus))
+	mux.HandleFunc("/api/scheduler/config", s.withAuth(s.handleSchedulerConfig))
 	mux.HandleFunc("/api/system/memory", s.withAuth(s.handleMemoryStatus))
 
 	registerGalleryRoutes(mux, s)
+	registerMediaV1Routes(mux, s)
+	registerStorageRoutes(mux, s)
 
 	fmt.Printf("[SERVER] Running on %s\\n", addr)
+	queue.StartDaemon(model)
+	s.startBackupWorker()
 	go ensureTailscaleExpose(s, addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		panic(err)
@@ -149,13 +184,13 @@ func RunServer(addr, dbPath, model string) {
 
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.supabaseAuth == nil {
-			next(w, r)
-			return
-		}
-		// Local Qt GUI — same machine, session already established via CLI setup.
-		if s.isLocalRequest(r) && s.hasLocalSession() {
-			next(w, r)
+		// Explicit opt-in for isolated local development only.
+		if s.isLocalRequest(r) && localAuthBypassEnabled() {
+			ownerID, _ := s.boundOwnerID()
+			if ownerID == "" {
+				ownerID = "local"
+			}
+			next(w, r.WithContext(auth.WithUser(r.Context(), &auth.User{ID: ownerID})))
 			return
 		}
 		authHeader := r.Header.Get("Authorization")
@@ -170,7 +205,15 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		user, err := s.verifyBearerToken(parts[1])
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusUnauthorized)
+			status := http.StatusUnauthorized
+			if s.supabaseAuth == nil && !strings.HasPrefix(parts[1], deviceTokenPrefix) {
+				status = http.StatusServiceUnavailable
+			}
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), status)
+			return
+		}
+		if err := s.authorizeUser(r, user); err != nil {
+			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
 			return
 		}
 		ctx := auth.WithUser(r.Context(), user)
@@ -179,17 +222,34 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) isLocalRequest(r *http.Request) bool {
+	if r.Header.Get("Forwarded") != "" || r.Header.Get("X-Forwarded-For") != "" ||
+		r.Header.Get("X-Forwarded-Host") != "" || r.Header.Get("X-Forwarded-Proto") != "" {
+		return false
+	}
 	host := r.Host
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-		return true
+	hostIsLoopback := host == "localhost" || host == "127.0.0.1" || host == "::1"
+	if !hostIsLoopback {
+		return false
 	}
 	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return ip == "127.0.0.1" || ip == "::1"
+		parsed := net.ParseIP(ip)
+		return parsed != nil && parsed.IsLoopback()
 	}
-	return strings.HasPrefix(r.RemoteAddr, "127.0.0.1:") || strings.HasPrefix(r.RemoteAddr, "[::1]:")
+	parsed := net.ParseIP(strings.Trim(r.RemoteAddr, "[]"))
+	return parsed != nil && parsed.IsLoopback()
+}
+
+func (s *Server) localOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.isLocalRequest(r) {
+			http.Error(w, `{"error":"local access only"}`, http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
 }
 
 func (s *Server) hasLocalSession() bool {
@@ -414,66 +474,139 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		Category  string  `json:"category"`
 		Score     float64 `json:"score"`
 		Thumbnail string  `json:"thumbnail"`
+		AddedAt   string  `json:"added_at,omitempty"`
 	}
 	var items []resultItem
 
 	if q != "" {
-		scores := make(map[string]float64)
+		type scored struct {
+			hash  string
+			score float64
+			added time.Time
+		}
+		scores := make(map[string]*scored)
+		addScore := func(hash string, score float64, added time.Time) {
+			if hash == "" {
+				return
+			}
+			if existing, ok := scores[hash]; ok {
+				existing.score += score
+				if existing.added.IsZero() || added.After(existing.added) {
+					existing.added = added
+				}
+				return
+			}
+			scores[hash] = &scored{hash: hash, score: score, added: added}
+		}
+
 		expander := search.NewQueryExpander()
 		expanded := expander.Expand(q)
 		emb, err := s.embed.GetEmbedding(expanded)
 		if err == nil && len(emb) > 0 {
 			for _, res := range s.index.Search(emb, 100) {
-				scores[res.Hash] = float64(res.Score) * 0.6
+				addScore(res.Hash, float64(res.Score)*0.55, time.Time{})
 			}
 		}
-		safeQ := strings.ReplaceAll(q, `"`, `""`)
-		rows, err := s.db.Query(
-			`SELECT rowid, rank FROM fts_captions WHERE fts_captions MATCH ? ORDER BY rank LIMIT 100`, safeQ)
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var rowid int
-				var rank float64
-				rows.Scan(&rowid, &rank)
-				var hash string
-				s.db.QueryRow("SELECT hash FROM images WHERE id = ?", rowid).Scan(&hash)
-				if hash == "" {
-					continue
+
+		terms := searchTerms(q + " " + expanded)
+		if ftsQ := ftsMatchQuery(terms); ftsQ != "" {
+			rows, err := s.db.Query(`
+				SELECT images.hash, fts_captions.rank, COALESCE(images.processed_at, images.created_at) as added
+				FROM fts_captions
+				JOIN images ON images.id = fts_captions.rowid
+				WHERE fts_captions MATCH ?
+				ORDER BY fts_captions.rank
+				LIMIT 200`, ftsQ)
+			if err == nil {
+				defer rows.Close()
+				for rows.Next() {
+					var hash string
+					var rank float64
+					var added sql.NullTime
+					rows.Scan(&hash, &rank, &added)
+					ftsScore := 1.0 / (1.0 + math.Abs(rank)/8.0)
+					addedAt := time.Time{}
+					if added.Valid {
+						addedAt = added.Time
+					}
+					addScore(hash, ftsScore*0.65, addedAt)
 				}
-				ftsScore := 1.0 / (1.0 + math.Abs(rank)/10.0)
-				scores[hash] += ftsScore * 0.4
 			}
 		}
-		type scored struct {
-			hash  string
-			score float64
-		}
-		var list []scored
-		for h, sc := range scores {
-			if sc >= 0.12 {
-				list = append(list, scored{h, sc})
+
+		if len(terms) > 0 {
+			clauses := make([]string, 0, len(terms)*3)
+			args := make([]interface{}, 0, len(terms)*3+1)
+			for _, term := range terms {
+				like := "%" + term + "%"
+				clauses = append(clauses,
+					"LOWER(COALESCE(caption, '')) LIKE ?",
+					"LOWER(COALESCE(tags, '')) LIKE ?",
+					"LOWER(COALESCE(ocr_text, '')) LIKE ?",
+				)
+				args = append(args, like, like, like)
+			}
+			args = append(args, 300)
+			rows, err := s.db.Query(`
+				SELECT hash, caption, category, tags, ocr_text, COALESCE(processed_at, created_at) as added
+				FROM images
+				WHERE `+strings.Join(clauses, " OR ")+`
+				ORDER BY COALESCE(processed_at, created_at) DESC
+				LIMIT ?`, args...)
+			if err == nil {
+				defer rows.Close()
+				for rows.Next() {
+					var hash, caption, category string
+					var tags, ocr sql.NullString
+					var added sql.NullTime
+					rows.Scan(&hash, &caption, &category, &tags, &ocr, &added)
+					text := strings.ToLower(caption + " " + tags.String + " " + ocr.String + " " + category)
+					score := lexicalScore(text, terms)
+					addedAt := time.Time{}
+					if added.Valid {
+						addedAt = added.Time
+					}
+					addScore(hash, score*0.45, addedAt)
+				}
 			}
 		}
-		sort.Slice(list, func(i, j int) bool { return list[i].score > list[j].score })
+
+		list := make([]scored, 0, len(scores))
+		for _, sc := range scores {
+			if sc.score >= 0.10 {
+				list = append(list, *sc)
+			}
+		}
+		sort.Slice(list, func(i, j int) bool {
+			if math.Abs(list[i].score-list[j].score) < 0.03 {
+				return list[i].added.After(list[j].added)
+			}
+			return list[i].score > list[j].score
+		})
 		if len(list) > 50 {
 			list = list[:50]
 		}
 		for _, si := range list {
 			var it resultItem
+			var added sql.NullTime
 			if err := s.db.QueryRow(
-				"SELECT path, hash, caption, category FROM images WHERE hash = ?", si.hash).
-				Scan(&it.Path, &it.Hash, &it.Caption, &it.Category); err != nil {
+				"SELECT path, hash, caption, category, COALESCE(processed_at, created_at) FROM images WHERE hash = ?", si.hash).
+				Scan(&it.Path, &it.Hash, &it.Caption, &it.Category, &added); err != nil {
 				continue
 			}
 			it.Score = math.Round(si.score*100) / 100
 			it.Thumbnail = "/api/thumbnail/" + it.Hash + "?size=small"
+			if validDBTime(added) {
+				it.AddedAt = added.Time.UTC().Format(time.RFC3339)
+			}
 			items = append(items, it)
 		}
 	}
 
 	if len(items) == 0 && q == "" {
-		rows, err := s.db.Query("SELECT path, hash, caption, category FROM images ORDER BY id DESC LIMIT 50")
+		rows, err := s.db.Query(`
+			SELECT path, hash, caption, category, COALESCE(processed_at, created_at) as added
+			FROM images ORDER BY added DESC, id DESC LIMIT 50`)
 		if err != nil {
 			http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 			return
@@ -481,8 +614,12 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		defer rows.Close()
 		for rows.Next() {
 			var it resultItem
-			rows.Scan(&it.Path, &it.Hash, &it.Caption, &it.Category)
+			var added sql.NullTime
+			rows.Scan(&it.Path, &it.Hash, &it.Caption, &it.Category, &added)
 			it.Thumbnail = "/api/thumbnail/" + it.Hash + "?size=small"
+			if validDBTime(added) {
+				it.AddedAt = added.Time.UTC().Format(time.RFC3339)
+			}
 			items = append(items, it)
 		}
 	}
@@ -493,6 +630,61 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		"count":   len(items),
 		"results": items,
 	})
+}
+
+func searchTerms(q string) []string {
+	seen := make(map[string]bool)
+	out := make([]string, 0)
+	for _, raw := range strings.Fields(strings.ToLower(q)) {
+		term := strings.TrimFunc(raw, func(r rune) bool {
+			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+		})
+		if len(term) < 2 || seen[term] {
+			continue
+		}
+		seen[term] = true
+		out = append(out, term)
+	}
+	return out
+}
+
+func ftsMatchQuery(terms []string) string {
+	if len(terms) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(terms))
+	for _, term := range terms {
+		clean := strings.Map(func(r rune) rune {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+				return r
+			}
+			return -1
+		}, term)
+		if clean != "" {
+			parts = append(parts, clean+"*")
+		}
+	}
+	return strings.Join(parts, " OR ")
+}
+
+func lexicalScore(text string, terms []string) float64 {
+	if text == "" || len(terms) == 0 {
+		return 0
+	}
+	var hits int
+	for _, term := range terms {
+		if strings.Contains(text, term) {
+			hits++
+		}
+	}
+	if hits == 0 {
+		return 0
+	}
+	return 0.35 + 0.65*(float64(hits)/float64(len(terms)))
+}
+
+func validDBTime(t sql.NullTime) bool {
+	return t.Valid && !t.Time.IsZero() && t.Time.Year() > 1
 }
 
 func (s *Server) handleSimilar(w http.ResponseWriter, r *http.Request) {
@@ -566,8 +758,8 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		limit = perPage
 	}
 	offset := (page - 1) * limit
-	orderBy := "id DESC"
-	if sortParam == "date" {
+	orderBy := "COALESCE(processed_at, created_at) DESC, id DESC"
+	if sortParam == "date" || sortParam == "taken" || sortParam == "captured" {
 		orderBy = "COALESCE(taken_at, processed_at, created_at) DESC"
 	}
 
@@ -575,11 +767,11 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	var err error
 	if cat != "" {
 		rows, err = s.db.Query(
-			"SELECT path, hash, caption, category FROM images WHERE category = ? ORDER BY "+orderBy+" LIMIT ? OFFSET ?",
+			"SELECT path, hash, caption, category, COALESCE(processed_at, created_at) FROM images WHERE category = ? ORDER BY "+orderBy+" LIMIT ? OFFSET ?",
 			cat, limit, offset)
 	} else {
 		rows, err = s.db.Query(
-			"SELECT path, hash, caption, category FROM images ORDER BY "+orderBy+" LIMIT ? OFFSET ?",
+			"SELECT path, hash, caption, category, COALESCE(processed_at, created_at) FROM images ORDER BY "+orderBy+" LIMIT ? OFFSET ?",
 			limit, offset)
 	}
 	if err != nil {
@@ -594,12 +786,17 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		Caption   string `json:"caption"`
 		Category  string `json:"category"`
 		Thumbnail string `json:"thumbnail"`
+		AddedAt   string `json:"added_at,omitempty"`
 	}
 	var results []item
 	for rows.Next() {
 		var it item
-		rows.Scan(&it.Path, &it.Hash, &it.Caption, &it.Category)
+		var added sql.NullTime
+		rows.Scan(&it.Path, &it.Hash, &it.Caption, &it.Category, &added)
 		it.Thumbnail = "/api/thumbnail/" + it.Hash + "?size=small"
+		if validDBTime(added) {
+			it.AddedAt = added.Time.UTC().Format(time.RFC3339)
+		}
 		results = append(results, it)
 	}
 	if results == nil {
@@ -669,6 +866,17 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	_ = s.db.QueryRow("SELECT COUNT(*) FROM mobile_devices WHERE is_active = 1").Scan(&deviceCount)
 	deviceCount++
 
+	var queuePct interface{}
+	if s.queue != nil {
+		if stats, err := s.queue.GetStats(); err == nil {
+			pending, _ := stats["pending"].(int)
+			totalQ, _ := stats["total"].(int)
+			if totalQ > 0 {
+				queuePct = int(math.Round(float64(pending) / float64(totalQ) * 100))
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"total":              total,
@@ -681,7 +889,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"devices_count":      deviceCount,
 		"people_count":       nil,
 		"places_count":       nil,
-		"ai_queue_pct":       nil,
+		"ai_queue_pct":       queuePct,
 	})
 }
 
@@ -728,7 +936,11 @@ func (s *Server) handleWebUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	uploadsDir := filepath.Join(filepath.Dir(os.Getenv("FOTORO_DB")), "uploads")
+	dbPath := os.Getenv("FOTORO_DB")
+	if dbPath == "" {
+		dbPath = "fotoro.db"
+	}
+	uploadsDir := filepath.Join(filepath.Dir(dbPath), "uploads")
 	os.MkdirAll(uploadsDir, 0755)
 
 	timestamp := time.Now().Format("20060102_150405")
@@ -747,18 +959,100 @@ func (s *Server) handleWebUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.queue == nil {
+		http.Error(w, `{"error":"upload queue not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	upload, err := s.queue.AddUpload(stagingPath, "web", header.Filename, header.Header.Get("Content-Type"), size)
+	if err != nil {
+		_ = os.Remove(stagingPath)
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusConflict)
+		return
+	}
+	if upload.Status == "duplicate" {
+		_ = os.Remove(stagingPath)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"path":    stagingPath,
-		"size":    size,
-		"message": "Image saved. Run 'fotoro scheduler' to process.",
+		"success":   true,
+		"upload_id": upload.ID,
+		"hash":      upload.Hash,
+		"status":    upload.Status,
+		"path":      stagingPath,
+		"size":      size,
+		"message":   "Image queued for processing.",
 	})
 }
 
 func (s *Server) handleUploadStatus(w http.ResponseWriter, r *http.Request) {
+	if s.queue == nil {
+		http.Error(w, `{"error":"upload queue not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	stats, err := s.queue.GetStats()
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	json.NewEncoder(w).Encode(stats)
+}
+
+func (s *Server) handleIngestFolder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"POST only"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	if s.queue == nil {
+		http.Error(w, `{"error":"upload queue not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+		return
+	}
+	req.Path = strings.TrimSpace(req.Path)
+	if req.Path == "" {
+		http.Error(w, `{"error":"missing path"}`, http.StatusBadRequest)
+		return
+	}
+	info, err := os.Stat(req.Path)
+	if err != nil || !info.IsDir() {
+		http.Error(w, `{"error":"folder not found"}`, http.StatusBadRequest)
+		return
+	}
+
+	files := collectImages(req.Path)
+	var queued, duplicates, skipped int
+	for _, path := range files {
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			skipped++
+			continue
+		}
+		upload, err := s.queue.AddUpload(path, "desktop-folder", filepath.Base(path), contentTypeFromName(path), info.Size())
+		if err != nil {
+			skipped++
+			continue
+		}
+		if upload.Status == "duplicate" {
+			duplicates++
+			continue
+		}
+		queued++
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"scanned":    len(files),
+		"queued":     queued,
+		"duplicates": duplicates,
+		"skipped":    skipped,
+	})
 }
 
 func (s *Server) handleSchedulerRun(w http.ResponseWriter, r *http.Request) {
@@ -766,16 +1060,125 @@ func (s *Server) handleSchedulerRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"POST only"}`, http.StatusMethodNotAllowed)
 		return
 	}
+	if s.queue == nil {
+		http.Error(w, `{"error":"upload queue not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	if s.queue.IsProcessing() {
+		http.Error(w, `{"error":"scheduler already processing"}`, http.StatusConflict)
+		return
+	}
+	go func() {
+		if err := s.queue.ProcessNow(s.model); err != nil {
+			fmt.Printf("[SCHEDULER] Run failed: %v\\n", err)
+		}
+	}()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "processing started"})
 }
 
 func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
+	if s.queue == nil {
+		http.Error(w, `{"error":"upload queue not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	stats, err := s.queue.GetStats()
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	if processing, _ := stats["processing"].(bool); processing {
+		stats["status"] = "processing"
+	} else {
+		stats["status"] = "idle"
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"pending": 0,
-		"status":  "idle",
-	})
+	json.NewEncoder(w).Encode(stats)
+}
+
+func (s *Server) handleSchedulerConfig(w http.ResponseWriter, r *http.Request) {
+	if s.queue == nil {
+		http.Error(w, `{"error":"upload queue not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		cfg := s.queue.Config()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled":             cfg.Enabled,
+			"process_time":        cfg.ProcessTime,
+			"process_days":        cfg.ProcessDays,
+			"max_concurrent":      cfg.MaxConcurrent,
+			"max_per_batch":       cfg.MaxPerBatch,
+			"process_screenshots": cfg.ProcessScreenshots,
+			"process_documents":   cfg.ProcessDocuments,
+			"process_photos":      cfg.ProcessPhotos,
+			"process_videos":      cfg.ProcessVideos,
+		})
+	case http.MethodPost:
+		cfg := s.queue.Config()
+		var body struct {
+			Enabled            *bool  `json:"enabled"`
+			ProcessTime        string `json:"process_time"`
+			ProcessDays        []int  `json:"process_days"`
+			MaxConcurrent      *int   `json:"max_concurrent"`
+			MaxPerBatch        *int   `json:"max_per_batch"`
+			ProcessScreenshots *bool  `json:"process_screenshots"`
+			ProcessDocuments   *bool  `json:"process_documents"`
+			ProcessPhotos      *bool  `json:"process_photos"`
+			ProcessVideos      *bool  `json:"process_videos"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+			return
+		}
+		if body.Enabled != nil {
+			cfg.Enabled = *body.Enabled
+		}
+		if body.ProcessTime != "" {
+			cfg.ProcessTime = body.ProcessTime
+		}
+		if body.ProcessDays != nil {
+			cfg.ProcessDays = body.ProcessDays
+		}
+		if body.MaxConcurrent != nil {
+			cfg.MaxConcurrent = clampInt(*body.MaxConcurrent, 1, 4)
+		}
+		if body.MaxPerBatch != nil {
+			cfg.MaxPerBatch = clampInt(*body.MaxPerBatch, 1, 500)
+		}
+		if body.ProcessScreenshots != nil {
+			cfg.ProcessScreenshots = *body.ProcessScreenshots
+		}
+		if body.ProcessDocuments != nil {
+			cfg.ProcessDocuments = *body.ProcessDocuments
+		}
+		if body.ProcessPhotos != nil {
+			cfg.ProcessPhotos = *body.ProcessPhotos
+		}
+		if body.ProcessVideos != nil {
+			cfg.ProcessVideos = *body.ProcessVideos
+		}
+		if err := s.queue.SaveConfig(cfg); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "saved"})
+	default:
+		http.Error(w, `{"error":"GET or POST only"}`, http.StatusMethodNotAllowed)
+	}
+}
+
+func clampInt(v, min, max int) int {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
 }
 
 func (s *Server) handleMemoryStatus(w http.ResponseWriter, r *http.Request) {

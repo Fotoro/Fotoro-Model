@@ -80,21 +80,13 @@ func (s *Server) withStrictAuth(next http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, `{"error":"invalid authorization header"}`, http.StatusUnauthorized)
 			return
 		}
-		token := parts[1]
-
-		if claims, err := localtoken.Verify(token); err == nil && claims.UserID != "" {
-			user := &auth.User{ID: claims.UserID, Provider: "fotoro-local"}
-			next(w, r.WithContext(auth.WithUser(r.Context(), user)))
-			return
-		}
-
-		if s.supabaseAuth == nil {
-			http.Error(w, `{"error":"auth not configured"}`, http.StatusUnauthorized)
-			return
-		}
-		user, err := s.supabaseAuth.VerifyToken(token)
+		user, err := s.verifyBearerToken(parts[1])
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusUnauthorized)
+			return
+		}
+		if err := s.authorizeUser(r, user); err != nil {
+			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
 			return
 		}
 		next(w, r.WithContext(auth.WithUser(r.Context(), user)))
@@ -102,6 +94,9 @@ func (s *Server) withStrictAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) verifyBearerToken(token string) (*auth.User, error) {
+	if strings.HasPrefix(token, deviceTokenPrefix) {
+		return s.verifyDeviceToken(token)
+	}
 	if claims, err := localtoken.Verify(token); err == nil && claims.UserID != "" {
 		return &auth.User{ID: claims.UserID, Provider: "fotoro-local"}, nil
 	}
@@ -147,10 +142,16 @@ func (s *Server) handleGalleryPhotos(w http.ResponseWriter, r *http.Request) {
 	var total int
 	_ = s.db.QueryRow("SELECT COUNT(*) FROM images").Scan(&total)
 
+	sortParam := r.URL.Query().Get("sort")
+	orderBy := "COALESCE(processed_at, created_at) DESC, id DESC"
+	if sortParam == "date" || sortParam == "taken" || sortParam == "captured" {
+		orderBy = "COALESCE(taken_at, processed_at, created_at) DESC, id DESC"
+	}
+
 	rows, err := s.db.Query(`
 		SELECT hash, caption, category,
 		       COALESCE(taken_at, processed_at, created_at) as taken
-		FROM images ORDER BY taken DESC LIMIT ? OFFSET ?`, limit, offset)
+		FROM images ORDER BY `+orderBy+` LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
