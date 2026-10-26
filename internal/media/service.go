@@ -419,11 +419,25 @@ func (s *Service) ListAssets(page, limit int, kind, deviceID, month string) ([]A
 	}
 	offset := (page - 1) * limit
 	var total int
-	where := ` WHERE (? = '' OR media_kind = ?)
-		AND (? = '' OR strftime('%Y-%m', COALESCE(captured_at, imported_at)) = ?)
-		AND (? = '' OR EXISTS (SELECT 1 FROM device_assets da
-			WHERE da.media_asset_id = media_assets.id AND da.device_id = ?))`
-	args := []interface{}{kind, kind, month, month, deviceID, deviceID}
+	filters := make([]string, 0, 3)
+	args := make([]interface{}, 0, 3)
+	if kind != "" {
+		filters = append(filters, "media_kind = ?")
+		args = append(args, kind)
+	}
+	if month != "" {
+		filters = append(filters, "strftime('%Y-%m', COALESCE(captured_at, imported_at)) = ?")
+		args = append(args, month)
+	}
+	if deviceID != "" {
+		filters = append(filters, `EXISTS (SELECT 1 FROM device_assets da
+			WHERE da.media_asset_id = media_assets.id AND da.device_id = ?)`)
+		args = append(args, deviceID)
+	}
+	where := ""
+	if len(filters) > 0 {
+		where = " WHERE " + strings.Join(filters, " AND ")
+	}
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM media_assets`+where, args...).Scan(&total)
 	var rows *sql.Rows
 	if err == nil {
@@ -434,16 +448,24 @@ func (s *Service) ListAssets(page, limit int, kind, deviceID, month string) ([]A
 	if err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
 	assets := make([]Asset, 0, limit)
 	for rows.Next() {
 		asset, err := scanAsset(rows)
-		if err == nil {
-			s.decorateAsset(&asset)
-			assets = append(assets, asset)
+		if err != nil {
+			rows.Close()
+			return nil, 0, err
 		}
+		assets = append(assets, asset)
 	}
-	return assets, total, rows.Err()
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := s.decorateAssetPage(assets); err != nil {
+		return nil, 0, err
+	}
+	return assets, total, nil
 }
 
 func (s *Service) GetAsset(id string) (*Asset, error) {
@@ -527,6 +549,72 @@ func (s *Service) decorateAsset(a *Asset) {
 	}
 }
 
+// A gallery page uses one copy lookup and one mount check. The SQLite pool has
+// one connection, so all asset rows must be closed before this query runs.
+func (s *Service) decorateAssetPage(assets []Asset) error {
+	if len(assets) == 0 {
+		return nil
+	}
+	type copyPaths struct{ primary, backup string }
+	paths := make(map[string]*copyPaths, len(assets))
+	placeholders := make([]string, 0, len(assets))
+	args := make([]interface{}, 0, len(assets))
+	for i := range assets {
+		a := &assets[i]
+		a.ContentURL = "/api/v1/media/" + a.ID + "/content"
+		if a.PreviewStatus == "ready" {
+			a.ThumbnailURL = "/api/v1/media/" + a.ID + "/thumbnail?size=small"
+		}
+		paths[a.ID] = &copyPaths{}
+		placeholders = append(placeholders, "?")
+		args = append(args, a.ID)
+	}
+	rows, err := s.db.Query(`SELECT media_asset_id, storage_name, storage_path FROM storage_copies
+		WHERE status = 'verified' AND checksum_verified = 1 AND media_asset_id IN (`+
+		strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id, name, path string
+		if err := rows.Scan(&id, &name, &path); err != nil {
+			rows.Close()
+			return err
+		}
+		if p := paths[id]; p != nil {
+			switch name {
+			case "primary":
+				p.primary = path
+			case "backup":
+				p.backup = path
+			}
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	backupAvailable := s.backupAvailable() == nil
+	for i := range assets {
+		a := &assets[i]
+		p := paths[a.ID]
+		if p.primary != "" {
+			a.StorageCopies++
+		}
+		if p.backup != "" {
+			a.StorageCopies++
+		}
+		if a.StorageCopies == 2 && backupAvailable {
+			primary, primaryErr := os.Stat(p.primary)
+			backup, backupErr := os.Stat(p.backup)
+			a.SafeToDelete = primaryErr == nil && backupErr == nil &&
+				primary.Mode().IsRegular() && backup.Mode().IsRegular()
+		}
+	}
+	return nil
+}
+
 func (s *Service) ContentPath(id string) (string, string, error) {
 	var path, mimeType string
 	err := s.db.QueryRow(`SELECT storage_path, mime_type FROM media_assets WHERE id = ? OR hash = ? LIMIT 1`, id, id).Scan(&path, &mimeType)
@@ -540,22 +628,15 @@ func (s *Service) ContentPath(id string) (string, string, error) {
 }
 
 func (s *Service) ThumbnailPath(id, size string) (string, error) {
+	if !isSHA256(id) {
+		return "", ErrNotFound
+	}
 	if size != "medium" {
 		size = "small"
 	}
-	var path string
-	err := s.db.QueryRow(`SELECT storage_path FROM derivatives WHERE media_asset_id = ? AND kind = ?`, id, "thumbnail_"+size).Scan(&path)
-	if err == nil {
-		return path, nil
-	}
-	if errors.Is(err, sql.ErrNoRows) && len(id) >= 2 {
-		legacy := filepath.Join(s.cacheDir, "thumbnails", size, id[:2], id+".jpg")
-		if _, statErr := os.Stat(legacy); statErr == nil {
-			return legacy, nil
-		}
-		return "", ErrNotFound
-	}
-	return "", err
+	// The content hash determines the thumbnail path. ServeFile handles
+	// existence checks and conditional requests without a database query.
+	return filepath.Join(s.cacheDir, "thumbnails", size, id[:2], id+".jpg"), nil
 }
 
 func (s *Service) CreateUpload(ownerID string, req CreateUploadRequest) (*UploadSession, error) {

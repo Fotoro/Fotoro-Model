@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -85,6 +86,10 @@ func TestResumableUploadAndBackup(t *testing.T) {
 	if result.Asset.Hash != hash || result.Asset.SafeToDelete || result.Asset.StorageCopies != 1 {
 		t.Fatalf("unexpected primary state: %+v", result.Asset)
 	}
+	page, total, err := s.ListAssets(1, 100, "", "", "")
+	if err != nil || total != 1 || len(page) != 1 || page[0].StorageCopies != 1 {
+		t.Fatalf("gallery page after offload: total=%d page=%+v err=%v", total, page, err)
+	}
 	path, _, err := s.ContentPath(hash)
 	if err != nil {
 		t.Fatal(err)
@@ -114,6 +119,10 @@ func TestResumableUploadAndBackup(t *testing.T) {
 	if err != nil || !asset.SafeToDelete || asset.StorageCopies != 2 {
 		t.Fatalf("expected two verified copies: asset=%+v err=%v", asset, err)
 	}
+	page, total, err = s.ListAssets(1, 100, "", "", "")
+	if err != nil || total != 1 || len(page) != 1 || !page[0].SafeToDelete {
+		t.Fatalf("gallery page lost verified backup state: total=%d page=%+v err=%v", total, page, err)
+	}
 	backupPath := filepath.Join(backup, "originals", hash[:2], hash+".jpg")
 	if err := os.WriteFile(backupPath, []byte("corrupted"), 0600); err != nil {
 		t.Fatal(err)
@@ -133,6 +142,41 @@ func TestResumableUploadAndBackup(t *testing.T) {
 	asset, err = s.GetAsset(hash)
 	if err != nil || !asset.SafeToDelete {
 		t.Fatalf("repaired secondary should be safe: asset=%+v err=%v", asset, err)
+	}
+}
+
+func BenchmarkListAssets100Of3000(b *testing.B) {
+	root := b.TempDir()
+	database, err := db.Open(filepath.Join(root, "fotoro.db"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer database.Close()
+	s, err := NewService(database, filepath.Join(root, "fotoro.db"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	tx, err := database.Begin()
+	if err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < 3000; i++ {
+		id := fmt.Sprintf("%064x", i+1)
+		if _, err := tx.Exec(`INSERT INTO media_assets (id, hash, original_name, storage_path, media_kind)
+			VALUES (?, ?, 'photo.jpg', '/fixture/photo.jpg', 'image')`, id, id); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		page, total, err := s.ListAssets(i%30+1, 100, "", "", "")
+		if err != nil || total != 3000 || len(page) != 100 {
+			b.Fatalf("page=%d total=%d err=%v", len(page), total, err)
+		}
 	}
 }
 
