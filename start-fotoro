@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+site_dir="$repo_dir/../Fotoro-Server/site"
+mode=${1:-web}
+
+usage() {
+  cat <<'HELP'
+Usage: ./start-fotoro [web|desktop|server]
+
+  web      Start the local API and website for browser offload testing (default)
+  desktop  Start the local API and Qt desktop app
+  server   Run only the API in the foreground
+
+Set FOTORO_PRIVATE_SITE=1 to publish web mode through Tailscale Serve.
+HELP
+}
+
+case "$mode" in
+  -h|--help|help) usage; exit 0 ;;
+  web|desktop|server) ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+cd "$repo_dir"
+mkdir -p bin
+echo "Building Fotoro server from current source…"
+go build -o bin/fotoro .
+
+if [[ "$mode" == server ]]; then
+  exec "$repo_dir/bin/fotoro" server
+fi
+
+api_addr=${FOTORO_ADDR:-127.0.0.1:8765}
+if [[ "$api_addr" != 127.0.0.1:* && "$api_addr" != localhost:* ]]; then
+  echo "Web and desktop launch require a loopback FOTORO_ADDR." >&2
+  exit 2
+fi
+api_url="http://$api_addr"
+api_pid=
+
+cleanup() {
+  if [[ -n "$api_pid" ]]; then
+    kill "$api_pid" 2>/dev/null || true
+    wait "$api_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+if curl --silent --fail --max-time 2 "$api_url/api/v1/health" >/dev/null; then
+  echo "Using Fotoro server already running at $api_url"
+else
+  if [[ "$mode" == web && "${FOTORO_PRIVATE_SITE:-0}" != 1 ]]; then
+    export FOTORO_SKIP_SERVE=1
+  fi
+  "$repo_dir/bin/fotoro" server &
+  api_pid=$!
+  ready=0
+  for ((attempt = 0; attempt < 60; attempt++)); do
+    if curl --silent --fail --max-time 2 "$api_url/api/v1/health" >/dev/null; then
+      ready=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [[ "$ready" != 1 ]]; then
+    echo "Fotoro server did not become ready. Check the startup error above." >&2
+    exit 1
+  fi
+fi
+
+if [[ "$mode" == desktop ]]; then
+  cmake -S desktop -B desktop/build
+  cmake --build desktop/build --target fotoro-desktop -j 2
+  echo "Opening Fotoro desktop…"
+  FOTORO_ADDR="$api_addr" desktop/build/fotoro-desktop
+  exit
+fi
+
+if [[ ! -d "$site_dir/node_modules" ]]; then
+  echo "Website dependencies are missing. Run: cd '$site_dir' && npm install" >&2
+  exit 1
+fi
+site_port=${FOTORO_SITE_PORT:-3000}
+if [[ ! "$site_port" =~ ^[0-9]+$ ]] || ((site_port < 1 || site_port > 65535)); then
+  echo "FOTORO_SITE_PORT must be a valid port number." >&2
+  exit 2
+fi
+echo "Open http://127.0.0.1:$site_port/dashboard/library after signing in."
+echo "Press Ctrl+C to stop this launcher."
+cd "$site_dir"
+FOTORO_LOCAL_SERVER_URL="$api_url" npm run dev -- --hostname 127.0.0.1 --port "$site_port"

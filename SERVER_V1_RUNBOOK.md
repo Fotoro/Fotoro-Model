@@ -2,6 +2,8 @@
 
 The v1 server runs on the owner's Linux host. The Next.js website runs on the same host. Tailscale Serve exposes the website and `/api/v1` to devices in the owner's tailnet. The Go API listens on loopback at `127.0.0.1:8765`; Next.js forwards device requests to it. Signed-in website requests resolve the owner's registered node in Supabase and forward the bearer token. Go checks that the token belongs to the locally bound owner. A paired mobile device uses a revocable, hashed device token with media-only scope. Tailscale membership is an additional network boundary, not a substitute for API authentication.
 
+For local testing from this directory, run `./start-fotoro`. It builds the current Go source, starts the API and website, and prints the library URL. `./start-fotoro desktop` starts the API and Qt desktop app; `./start-fotoro server` runs only the API. The web and desktop modes stop the API they started when the launcher exits. Set `FOTORO_PRIVATE_SITE=1` for the web mode to configure private Tailscale Serve after the site starts.
+
 ## Configure and start
 
 1. Install Tailscale on the Linux host and each phone. Sign them into the intended tailnet. Configure the host with `./fotoro setup` and `./fotoro nodesync` so the `nodes` row is linked to the same Supabase user who signs into the website.

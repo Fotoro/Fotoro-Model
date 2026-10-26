@@ -27,7 +27,6 @@ var pendingAuthStates sync.Map // state -> expiry time.Time
 
 type authSessionResponse struct {
 	Authenticated bool       `json:"authenticated"`
-	AccessToken   string     `json:"access_token"`
 	User          *auth.User `json:"user"`
 }
 
@@ -43,6 +42,7 @@ func RunWebSignIn(dbPath, addr string, timeout time.Duration) (string, *auth.Use
 	defer stop()
 
 	state := generateAuthState()
+	loginStartedAt := time.Now()
 	loginURL := buildWebLoginURL(baseURL+"/auth/callback", state, true)
 
 	useHandoff := cliauth.IsConfigured() && cliauth.HasServiceKey()
@@ -71,7 +71,7 @@ func RunWebSignIn(dbPath, addr string, timeout time.Duration) (string, *auth.Use
 		fmt.Println("See supabase/website_login_fix.js for the website patch.")
 	}
 	fmt.Println()
-	token, user, err := pollUntilSignedIn(baseURL, dbPath, state, useHandoff, timeout)
+	token, user, err := pollUntilSignedIn(baseURL, dbPath, state, useHandoff, loginStartedAt, timeout)
 	if err != nil {
 		return "", nil, err
 	}
@@ -145,18 +145,13 @@ func (s *Server) handleAuthLoginURL(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) saveAuthFromCallback(access, refresh, userID, email, name, avatar string) *auth.User {
-	user := &auth.User{
-		ID:       userID,
-		Email:    email,
-		Name:     name,
-		Avatar:   avatar,
-		Provider: "google",
+func (s *Server) saveAuthFromCallback(access, refresh string) (*auth.User, error) {
+	if s.supabaseAuth == nil {
+		return nil, fmt.Errorf("authentication service unavailable")
 	}
-	if s.supabaseAuth != nil && access != "" {
-		if verified, err := s.supabaseAuth.VerifyToken(access); err == nil {
-			user = verified
-		}
+	user, err := s.supabaseAuth.VerifyToken(access)
+	if err != nil {
+		return nil, fmt.Errorf("invalid access token: %w", err)
 	}
 	s.authMu.Lock()
 	s.authAccessToken = access
@@ -171,7 +166,7 @@ func (s *Server) saveAuthFromCallback(access, refresh, userID, email, name, avat
 		Name:         user.Name,
 		AvatarURL:    user.Avatar,
 	})
-	return user
+	return user, nil
 }
 
 func ensureAuthServer(addr, dbPath string) (stop func(), baseURL string, err error) {
@@ -204,10 +199,10 @@ func ensureAuthServer(addr, dbPath string) (stop func(), baseURL string, err err
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.handleHealth)
-	mux.HandleFunc("/api/auth/status", s.handleAuthStatus)
-	mux.HandleFunc("/api/auth/session", s.handleAuthSession)
-	mux.HandleFunc("/api/auth/login-url", s.handleAuthLoginURL)
-	mux.HandleFunc("/auth/callback", s.handleAuthCallbackPage)
+	mux.HandleFunc("/api/auth/status", s.localOnly(s.handleAuthStatus))
+	mux.HandleFunc("/api/auth/session", s.localOnly(s.handleAuthSession))
+	mux.HandleFunc("/api/auth/login-url", s.localOnly(s.handleAuthLoginURL))
+	mux.HandleFunc("/auth/callback", s.localOnly(s.handleAuthCallbackPage))
 
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
@@ -234,10 +229,10 @@ func ensureAuthServer(addr, dbPath string) (stop func(), baseURL string, err err
 	return nil, "", fmt.Errorf("auth server did not start on %s (port may be in use)", addr)
 }
 
-func pollUntilSignedIn(baseURL, dbPath, state string, useHandoff bool, timeout time.Duration) (string, *auth.User, error) {
+func pollUntilSignedIn(baseURL, dbPath, state string, useHandoff bool, startedAt time.Time, timeout time.Duration) (string, *auth.User, error) {
 	deadline := time.Now().Add(timeout)
 	for {
-		if token, user, ok, err := fetchAuthSession(baseURL); err != nil {
+		if token, user, ok, err := fetchAuthSessionFromDB(dbPath, startedAt); err != nil {
 			return "", nil, err
 		} else if ok {
 			return token, user, nil
@@ -310,24 +305,28 @@ func persistCLISession(baseURL, dbPath string, sess *cliauth.Session) (*auth.Use
 }
 
 func pollAuthSession(baseURL string, timeout time.Duration) (string, *auth.User, error) {
-	return pollUntilSignedIn(baseURL, "", "", false, timeout)
+	return "", nil, fmt.Errorf("pollAuthSession is obsolete; session tokens are never exposed over HTTP")
 }
 
-func fetchAuthSession(baseURL string) (string, *auth.User, bool, error) {
-	resp, err := http.Get(baseURL + "/api/auth/session")
+func fetchAuthSessionFromDB(dbPath string, startedAt time.Time) (string, *auth.User, bool, error) {
+	if dbPath == "" {
+		return "", nil, false, nil
+	}
+	database, err := db.Open(dbPath)
 	if err != nil {
+		return "", nil, false, err
+	}
+	defer database.Close()
+	sess, err := database.GetAuthSession()
+	if err != nil || sess == nil {
+		return "", nil, false, err
+	}
+	if !startedAt.IsZero() && sess.UpdatedAt.Before(startedAt.Add(-time.Second)) {
 		return "", nil, false, nil
 	}
-	defer resp.Body.Close()
-
-	var out authSessionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", nil, false, nil
-	}
-	if !out.Authenticated || out.AccessToken == "" || out.User == nil {
-		return "", nil, false, nil
-	}
-	return out.AccessToken, out.User, true, nil
+	return sess.AccessToken, &auth.User{
+		ID: sess.UserID, Email: sess.Email, Name: sess.Name, Avatar: sess.AvatarURL, Provider: "google",
+	}, true, nil
 }
 
 func reachable(url string) bool {

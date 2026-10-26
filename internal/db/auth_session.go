@@ -1,6 +1,9 @@
 package db
 
-import "database/sql"
+import (
+	"database/sql"
+	"time"
+)
 
 type AuthSession struct {
 	AccessToken  string
@@ -9,6 +12,7 @@ type AuthSession struct {
 	Email        string
 	Name         string
 	AvatarURL    string
+	UpdatedAt    time.Time
 }
 
 func (d *DB) SaveAuthSession(s AuthSession) error {
@@ -29,11 +33,12 @@ func (d *DB) SaveAuthSession(s AuthSession) error {
 func (d *DB) GetAuthSession() (*AuthSession, error) {
 	var s AuthSession
 	var access, refresh, uid, email, name, avatar sql.NullString
+	var updated sql.NullTime
 	err := d.QueryRow(`
 		SELECT auth_access_token, auth_refresh_token, auth_user_id,
-		       auth_user_email, auth_user_name, auth_user_avatar
+		       auth_user_email, auth_user_name, auth_user_avatar, updated_at
 		FROM server_config WHERE id = 1
-	`).Scan(&access, &refresh, &uid, &email, &name, &avatar)
+	`).Scan(&access, &refresh, &uid, &email, &name, &avatar, &updated)
 	if err != nil {
 		return nil, err
 	}
@@ -55,6 +60,9 @@ func (d *DB) GetAuthSession() (*AuthSession, error) {
 	}
 	if avatar.Valid {
 		s.AvatarURL = avatar.String
+	}
+	if updated.Valid {
+		s.UpdatedAt = updated.Time
 	}
 	return &s, nil
 }

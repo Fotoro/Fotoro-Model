@@ -49,14 +49,10 @@ func (s *Server) handleAuthCallbackPage(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		clearAuthState(state)
-		s.saveAuthFromCallback(
-			access,
-			q.Get("refresh_token"),
-			q.Get("user_id"),
-			q.Get("email"),
-			q.Get("name"),
-			q.Get("avatar_url"),
-		)
+		if _, err := s.saveAuthFromCallback(access, q.Get("refresh_token")); err != nil {
+			http.Error(w, "Sign-in verification failed. Close this tab and retry.", http.StatusUnauthorized)
+			return
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(buildWebAuthSuccessHTML(cliMode)))
 		return
@@ -96,8 +92,10 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"authenticated": true,
-			"access_token":  token,
-			"user":          user,
+			// This route is wrapped by localOnly in both server modes. The Qt
+			// desktop client reads this token after interactive sign-in.
+			"access_token": token,
+			"user":         user,
 		})
 	case http.MethodPost:
 		body, err := io.ReadAll(r.Body)
@@ -123,17 +121,14 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"missing access_token"}`, http.StatusBadRequest)
 			return
 		}
-		user := &auth.User{
-			ID:       req.User.ID,
-			Email:    req.User.Email,
-			Name:     req.User.Name,
-			Avatar:   req.User.Avatar,
-			Provider: "google",
+		if s.supabaseAuth == nil {
+			http.Error(w, `{"error":"authentication service unavailable"}`, http.StatusServiceUnavailable)
+			return
 		}
-		if s.supabaseAuth != nil {
-			if verified, err := s.supabaseAuth.VerifyToken(req.AccessToken); err == nil {
-				user = verified
-			}
+		user, err := s.supabaseAuth.VerifyToken(req.AccessToken)
+		if err != nil {
+			http.Error(w, `{"error":"invalid access token"}`, http.StatusUnauthorized)
+			return
 		}
 		s.authMu.Lock()
 		s.authAccessToken = req.AccessToken
@@ -171,7 +166,7 @@ func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"setup_complete": complete,
 		"authenticated":  authenticated,
-		"user":             user,
+		"user":           user,
 	})
 }
 

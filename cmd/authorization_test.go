@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
@@ -48,5 +50,28 @@ func TestOwnerAndDeviceAccess(t *testing.T) {
 				t.Fatalf("allowed=%v, error=%v", tc.allowed, err)
 			}
 		})
+	}
+}
+
+func TestDesktopSessionTokenStaysLoopbackOnly(t *testing.T) {
+	s := &Server{authUser: &auth.User{ID: "owner-1"}, authAccessToken: "desktop-token"}
+	handler := s.localOnly(s.handleAuthSession)
+	local := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8765/api/auth/session", nil)
+	local.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+	handler(w, local)
+	if w.Code != http.StatusOK {
+		t.Fatalf("local desktop session: HTTP %d", w.Code)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil || payload["access_token"] != "desktop-token" {
+		t.Fatalf("desktop token missing: %v", err)
+	}
+	remote := httptest.NewRequest(http.MethodGet, "https://node.example/api/auth/session", nil)
+	remote.RemoteAddr = "100.100.100.100:12345"
+	w = httptest.NewRecorder()
+	handler(w, remote)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("remote desktop session was allowed: HTTP %d", w.Code)
 	}
 }
