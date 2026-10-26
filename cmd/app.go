@@ -78,8 +78,14 @@ func RunApp(dbPath, model string) {
 	guiPaths := []string{
 		filepath.Join(dir, "fotoro-gui"),
 		filepath.Join(dir, "fotoro-desktop"),
+		filepath.Join(dir, "desktop", "build-fotoro", "fotoro-desktop"),
+		filepath.Join(dir, "desktop", "build", "fotoro-desktop"),
+		filepath.Join(dir, "desktop", "build", "fotoro"),
 		"./fotoro-gui",
 		"./fotoro-desktop",
+		"./desktop/build-fotoro/fotoro-desktop",
+		"./desktop/build/fotoro-desktop",
+		"./desktop/build/fotoro",
 	}
 
 	var guiPath string
@@ -91,15 +97,28 @@ func RunApp(dbPath, model string) {
 	}
 
 	if guiPath == "" {
-		fmt.Println("[WARN] GUI binary not found. Building from source...")
-		buildCmd := exec.Command("go", "build", "-o", "fotoro-gui", "./gui")
-		buildCmd.Dir = filepath.Dir(exe)
-		if err := buildCmd.Run(); err != nil {
-			fmt.Printf("[WARN] Could not build GUI. Server is running at %s\n", baseURL)
-			fmt.Println("[INFO] Use the API directly or open the website dashboard")
+		fmt.Println("[WARN] Desktop binary not found. Building Qt desktop app...")
+		sourceDir := "desktop"
+		buildDir := filepath.Join("desktop", "build-fotoro")
+		configCmd := exec.Command("cmake", "-S", sourceDir, "-B", buildDir)
+		configCmd.Stdout = os.Stdout
+		configCmd.Stderr = os.Stderr
+		if err := configCmd.Run(); err != nil {
+			fmt.Printf("[WARN] Could not configure desktop app: %v\n", err)
+			fmt.Printf("[INFO] Server is running at %s\n", baseURL)
+			fmt.Println("[INFO] Install Qt6 development packages and CMake, then run: cmake -S desktop -B desktop/build-fotoro")
 			select {}
 		}
-		guiPath = "./fotoro-gui"
+		buildCmd := exec.Command("cmake", "--build", buildDir, "--target", "fotoro-desktop", "-j", "2")
+		buildCmd.Stdout = os.Stdout
+		buildCmd.Stderr = os.Stderr
+		if err := buildCmd.Run(); err != nil {
+			fmt.Printf("[WARN] Could not build desktop app: %v\n", err)
+			fmt.Printf("[INFO] Server is running at %s\n", baseURL)
+			fmt.Println("[INFO] After fixing Qt/CMake dependencies, run: cmake --build desktop/build-fotoro --target fotoro-desktop")
+			select {}
+		}
+		guiPath = filepath.Join(buildDir, "fotoro-desktop")
 	}
 
 	fmt.Println("[INIT] Launching GUI...")

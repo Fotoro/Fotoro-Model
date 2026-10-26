@@ -10,5 +10,5 @@ set(CMAKE_AUTOUIC ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network)
 
-add_executable(fotoro main.cpp)
-target_link_libraries(fotoro PRIVATE Qt6::Core Qt6::Widgets Qt6::Network)
+add_executable(fotoro-desktop main.cpp)
+target_link_libraries(fotoro-desktop PRIVATE Qt6::Core Qt6::Widgets Qt6::Network)

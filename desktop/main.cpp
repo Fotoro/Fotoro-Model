@@ -51,6 +51,7 @@
 #include <QGraphicsDropShadowEffect>
 #include <QFontDatabase>
 #include <QFile>
+#include <QFileDialog>
 #include <QMessageBox>
 #include <QInputDialog>
 #include <QDialog>
@@ -1437,16 +1438,40 @@ public:
         _schedStatus = new QLabel("Not configured", schedCard);
         _schedStatus->setFont(uiFont(11));
         schedCard->layout()->addWidget(_schedStatus);
-        auto *editSchedBtn = new CircularButton("Edit Schedule", CircularButton::Outline, schedCard);
-        schedCard->layout()->addWidget(editSchedBtn);
+        _enableScheduleCheck = new QCheckBox("Run automatically", schedCard);
+        _enableScheduleCheck->setFont(uiFont(10));
+        _enableScheduleCheck->setStyleSheet(checkStyle());
+        schedCard->layout()->addWidget(_enableScheduleCheck);
+        auto *scheduleRow = new QHBoxLayout();
+        scheduleRow->setSpacing(8);
+        _scheduleTimeEdit = new QTimeEdit(schedCard);
+        _scheduleTimeEdit->setDisplayFormat("HH:mm");
+        _scheduleTimeEdit->setTime(QTime(2, 0));
+        _scheduleTimeEdit->setFont(uiFont(10));
+        _scheduleTimeEdit->setStyleSheet(inputStyle());
+        scheduleRow->addWidget(_scheduleTimeEdit);
+        _batchSpin = new QSpinBox(schedCard);
+        _batchSpin->setRange(1, 500);
+        _batchSpin->setValue(25);
+        _batchSpin->setSuffix(" / batch");
+        _batchSpin->setFont(uiFont(10));
+        _batchSpin->setStyleSheet(inputStyle());
+        scheduleRow->addWidget(_batchSpin);
+        static_cast<QVBoxLayout*>(schedCard->layout())->addLayout(scheduleRow);
+        auto *saveSchedBtn = new CircularButton("Save Schedule", CircularButton::Outline, schedCard);
+        schedCard->layout()->addWidget(saveSchedBtn);
+        connect(saveSchedBtn, &QPushButton::clicked, this, &SettingsPanel::onSaveSchedule);
         layout->addWidget(schedCard);
 
         auto *queueCard = createCard("Upload Queue");
         _queueStatus = new QLabel("0 pending", queueCard);
         _queueStatus->setFont(uiFont(11));
         queueCard->layout()->addWidget(_queueStatus);
+        auto *queueFolderBtn = new CircularButton("Queue Folder", CircularButton::Outline, queueCard);
+        queueCard->layout()->addWidget(queueFolderBtn);
         _runSchedulerBtn = new CircularButton("Process Now", CircularButton::Primary, queueCard);
         queueCard->layout()->addWidget(_runSchedulerBtn);
+        connect(queueFolderBtn, &QPushButton::clicked, this, &SettingsPanel::onQueueFolder);
         connect(_runSchedulerBtn, &QPushButton::clicked, this, &SettingsPanel::onRunScheduler);
         layout->addWidget(queueCard);
 
@@ -1470,8 +1495,12 @@ public:
         auto *timer = new QTimer(this);
         connect(timer, &QTimer::timeout, this, &SettingsPanel::refreshStatus);
         timer->start(5000);
+        loadSchedulerConfig();
         refreshStatus();
     }
+
+signals:
+    void libraryChanged();
 
 public slots:
     void refreshStatus() {
@@ -1522,9 +1551,11 @@ public slots:
             if (schedReply->error() == QNetworkReply::NoError) {
                 auto obj = QJsonDocument::fromJson(schedReply->readAll()).object();
                 QString status = obj.value("status").toString("idle");
-                _schedStatus->setText(status == "idle" ? "Idle" : status);
+                const bool processing = status == "processing";
+                _schedStatus->setText(status == "idle" ? "Idle" : "Processing");
                 int pending = obj.value("pending").toInt();
                 _queueStatus->setText(QString("%1 pending").arg(pending));
+                _runSchedulerBtn->setEnabled(!processing && pending > 0);
             }
             schedReply->deleteLater();
         });
@@ -1585,14 +1616,93 @@ public slots:
         auto *reply = _net->post(apiRequest(QUrl(baseURL() + "/api/scheduler/run")), QByteArray());
         connect(reply, &QNetworkReply::finished, this, [this, reply]() {
             auto obj = QJsonDocument::fromJson(reply->readAll()).object();
+            if (reply->error() != QNetworkReply::NoError) {
+                QMessageBox::warning(this, "Scheduler",
+                    obj.value("error").toString("Could not start processing"));
+                reply->deleteLater();
+                refreshStatus();
+                return;
+            }
             reply->deleteLater();
             QMessageBox::information(this, "Scheduler",
                 obj.value("status").toString("Processing started"));
+            refreshStatus();
+            emit libraryChanged();
+        });
+    }
+
+    void onQueueFolder() {
+        const QString dir = QFileDialog::getExistingDirectory(this, "Choose Image Folder", QDir::homePath());
+        if (dir.isEmpty()) return;
+        QJsonObject body;
+        body.insert("path", dir);
+        QNetworkRequest req = apiRequest(QUrl(baseURL() + "/api/ingest/folder"));
+        req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+        auto *reply = _net->post(req, QJsonDocument(body).toJson(QJsonDocument::Compact));
+        connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+            auto obj = QJsonDocument::fromJson(reply->readAll()).object();
+            if (reply->error() != QNetworkReply::NoError) {
+                QMessageBox::warning(this, "Queue Folder",
+                    obj.value("error").toString("Could not queue this folder"));
+                reply->deleteLater();
+                refreshStatus();
+                return;
+            }
+            const QString msg = QString("Scanned %1 images\nQueued %2\nDuplicates %3\nSkipped %4")
+                .arg(obj.value("scanned").toInt())
+                .arg(obj.value("queued").toInt())
+                .arg(obj.value("duplicates").toInt())
+                .arg(obj.value("skipped").toInt());
+            reply->deleteLater();
+            QMessageBox::information(this, "Queue Folder", msg);
+            refreshStatus();
+        });
+    }
+
+    void onSaveSchedule() {
+        QJsonObject body;
+        body.insert("enabled", _enableScheduleCheck->isChecked());
+        body.insert("process_time", _scheduleTimeEdit->time().toString("HH:mm"));
+        body.insert("max_concurrent", 1);
+        body.insert("max_per_batch", _batchSpin->value());
+        body.insert("process_screenshots", true);
+        body.insert("process_documents", true);
+        body.insert("process_photos", true);
+        body.insert("process_videos", false);
+        QNetworkRequest req = apiRequest(QUrl(baseURL() + "/api/scheduler/config"));
+        req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+        auto *reply = _net->post(req, QJsonDocument(body).toJson(QJsonDocument::Compact));
+        connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+            auto obj = QJsonDocument::fromJson(reply->readAll()).object();
+            if (reply->error() != QNetworkReply::NoError) {
+                QMessageBox::warning(this, "Schedule",
+                    obj.value("error").toString("Could not save schedule"));
+            } else {
+                _schedStatus->setText(_enableScheduleCheck->isChecked()
+                    ? "Scheduled at " + _scheduleTimeEdit->time().toString("HH:mm")
+                    : "Idle");
+            }
+            reply->deleteLater();
             refreshStatus();
         });
     }
 
 private:
+    void loadSchedulerConfig() {
+        auto *reply = _net->get(apiRequest(QUrl(baseURL() + "/api/scheduler/config")));
+        connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+            if (reply->error() == QNetworkReply::NoError) {
+                auto obj = QJsonDocument::fromJson(reply->readAll()).object();
+                _enableScheduleCheck->setChecked(obj.value("enabled").toBool());
+                const QTime t = QTime::fromString(obj.value("process_time").toString("02:00"), "HH:mm");
+                if (t.isValid()) _scheduleTimeEdit->setTime(t);
+                const int batch = obj.value("max_per_batch").toInt(25);
+                _batchSpin->setValue(qBound(1, batch, 500));
+            }
+            reply->deleteLater();
+        });
+    }
+
     QFrame* createCard(const QString &title) {
         auto *card = new QFrame(this);
         card->setStyleSheet(R"(
@@ -1609,6 +1719,28 @@ private:
         return card;
     }
 
+    QString inputStyle() const {
+        return R"(
+            QTimeEdit, QSpinBox { background-color: )" + Colors::bgElevated.name() + R"(;
+                color: )" + Colors::textPrimary.name() + R"(;
+                border: 1px solid )" + Colors::borderDefault.name() + R"(;
+                border-radius: 8px; padding: 7px 10px; }
+            QTimeEdit::up-button, QTimeEdit::down-button,
+            QSpinBox::up-button, QSpinBox::down-button { width: 0; }
+        )";
+    }
+
+    QString checkStyle() const {
+        return R"(
+            QCheckBox { color: )" + Colors::textSecondary.name() + R"(; spacing: 8px; }
+            QCheckBox::indicator { width: 16px; height: 16px; border-radius: 4px;
+                border: 1px solid )" + Colors::borderDefault.name() + R"(;
+                background: )" + Colors::bgElevated.name() + R"(; }
+            QCheckBox::indicator:checked { background: )" + Colors::foreground.name() + R"(;
+                border-color: )" + Colors::foreground.name() + R"(; }
+        )";
+    }
+
     QNetworkAccessManager *_net = nullptr;
     CircularButton *_startServerBtn = nullptr;
     CircularButton *_stopServerBtn = nullptr;
@@ -1622,6 +1754,9 @@ private:
     QLabel *_schedStatus = nullptr;
     QLabel *_queueStatus = nullptr;
     QLabel *_qrCode = nullptr;
+    QCheckBox *_enableScheduleCheck = nullptr;
+    QTimeEdit *_scheduleTimeEdit = nullptr;
+    QSpinBox *_batchSpin = nullptr;
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1816,6 +1951,10 @@ public:
         _settingsPanel = new SettingsPanel(central);
         _settingsPanel->setFixedWidth(320);
         _settingsPanel->hide();
+        connect(_settingsPanel, &SettingsPanel::libraryChanged, this, [this]() {
+            fetchStats();
+            reloadGallery();
+        });
         
         // LIGHTBOX
         _lightbox = new LightboxOverlay(central);
