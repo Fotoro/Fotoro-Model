@@ -38,6 +38,12 @@ cache/
 *.ckpt
 
 desktop/build/
+desktop/build-fotoro/
+uploads/
+images.zip
+
+supabase/cli_auth_sessions.sql
+supabase/cli_auth_sessions_add_completed_at.sql
 
 # =========================
 # Generated Data
