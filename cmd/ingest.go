@@ -13,6 +13,7 @@ import (
 	"fotoro/internal/db"
 	"fotoro/internal/ollama"
 	"fotoro/internal/search"
+	"fotoro/internal/system"
 	"fotoro/internal/validate"
 )
 
@@ -24,16 +25,8 @@ func RunIngest(dir, dbPath, model string) {
 	}
 	defer database.Close()
 
-	fmt.Println("[INIT] Starting inference backend...")
 	client := ollama.NewClient("", model)
-	if err := client.HealthCheck(); err != nil {
-		fmt.Printf("[INIT] Backend will start on first request (%v)\n", err)
-	}
-
 	embedClient := ollama.NewEmbedClient()
-	if err := embedClient.HealthCheck(); err != nil {
-		fmt.Println("[WARN] Embed server not running. Search will be FTS-only until you run: fotoro backfill")
-	}
 
 	files := collectImages(dir)
 	fmt.Printf("[INIT] Found %d image files\n", len(files))
@@ -73,13 +66,31 @@ func RunIngest(dir, dbPath, model string) {
 		return
 	}
 
-	visionWorkers := 2
+	modelPath := os.Getenv("FOTORO_MODEL_PATH")
+	if modelPath == "" {
+		modelPath = "./models/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf"
+	}
+	if ok, msg := system.CanStartLLM(modelPath); !ok {
+		fmt.Printf("[ERROR] Memory guard refused VLM start: %s\n", msg)
+		fmt.Println("[HINT] Close heavy applications, reduce batch size, or run ingestion at night.")
+		return
+	}
+
+	fmt.Println("[INIT] Starting inference backend...")
+	if err := client.HealthCheck(); err != nil {
+		fmt.Printf("[INIT] Backend will start on first request (%v)\n", err)
+	}
+	if err := embedClient.HealthCheck(); err != nil {
+		fmt.Println("[WARN] Embed server not running. Search will be FTS-only until you run: fotoro backfill")
+	}
+
+	visionWorkers := 1
 	if w := os.Getenv("FOTORO_VISION_WORKERS"); w != "" {
 		if n, err := strconv.Atoi(w); err == nil && n > 0 {
 			visionWorkers = n
 		}
 	}
-	
+
 	llmWorkers := 1
 	fmt.Printf("[INIT] Vision workers: %d | LLM workers: %d\n", visionWorkers, llmWorkers)
 

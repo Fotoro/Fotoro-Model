@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/supabase-community/supabase-go"
+	gotruetypes "github.com/supabase-community/gotrue-go/types"
 )
 
 // Client wraps the Supabase Go client with Fotoro-specific helpers
@@ -31,7 +32,7 @@ func NewClient() (*Client, error) {
 		return nil, fmt.Errorf("SUPABASE_URL and SUPABASE_ANON_KEY required")
 	}
 	
-	client, err := supabase.NewClient(url, anonKey, "", nil)
+	client, err := supabase.NewClient(url, anonKey, nil)
 	if err != nil {
 		return nil, fmt.Errorf("supabase init: %w", err)
 	}
@@ -49,11 +50,19 @@ func NewClient() (*Client, error) {
 
 // SignUp creates a new user account
 func (c *Client) SignUp(email, password string) (map[string]interface{}, error) {
-	data, err := c.client.SignUp(email, password)
+	data, err := c.client.Auth.Signup(gotruetypes.SignupRequest{Email: email, Password: password})
 	if err != nil {
 		return nil, err
 	}
-	return data, nil
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]interface{}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // SignIn authenticates user
@@ -63,11 +72,8 @@ func (c *Client) SignIn(email, password string) (string, error) {
 		return "", err
 	}
 	
-	// Extract access token
-	if session, ok := data["session"].(map[string]interface{}); ok {
-		if token, ok := session["access_token"].(string); ok {
-			return token, nil
-		}
+	if data.AccessToken != "" {
+		return data.AccessToken, nil
 	}
 	return "", fmt.Errorf("no access token in response")
 }

@@ -13,6 +13,7 @@ import (
 	"fotoro/internal/db"
 	"fotoro/internal/ollama"
 	"fotoro/internal/search"
+	"fotoro/internal/system"
 	"fotoro/internal/validate"
 )
 
@@ -52,7 +53,7 @@ type PendingUpload struct {
 	CreatedAt    time.Time
 	ProcessedAt  *time.Time
 	ErrorMsg     string
-	Priority     int    // Higher = process first
+	Priority     int // Higher = process first
 	OriginalName string
 	FileSize     int64
 	ContentType  string
@@ -98,8 +99,8 @@ func (jq *JobQueue) InitDB() error {
 			enabled INTEGER DEFAULT 0,
 			process_time TEXT DEFAULT '02:00',
 			process_days TEXT,
-			max_concurrent INTEGER DEFAULT 2,
-			max_per_batch INTEGER DEFAULT 100,
+			max_concurrent INTEGER DEFAULT 1,
+			max_per_batch INTEGER DEFAULT 25,
 			process_screenshots INTEGER DEFAULT 1,
 			process_documents INTEGER DEFAULT 1,
 			process_photos INTEGER DEFAULT 1,
@@ -121,7 +122,8 @@ func (jq *JobQueue) InitDB() error {
 // LoadConfig reads schedule config from DB
 func (jq *JobQueue) LoadConfig() error {
 	var enabled, maxConc, maxBatch, procSS, procDoc, procPhoto, procVideo int
-	var procTime, procDays string
+	var procTime string
+	var procDays sql.NullString
 	var lastRun, nextRun sql.NullTime
 
 	err := jq.db.QueryRow(`
@@ -144,9 +146,10 @@ func (jq *JobQueue) LoadConfig() error {
 	jq.config.ProcessDocuments = procDoc == 1
 	jq.config.ProcessPhotos = procPhoto == 1
 	jq.config.ProcessVideos = procVideo == 1
+	jq.config.ProcessDays = nil
 
-	if procDays != "" {
-		for _, d := range strings.Split(procDays, ",") {
+	if procDays.Valid && procDays.String != "" {
+		for _, d := range strings.Split(procDays.String, ",") {
 			if n, err := strconv.Atoi(strings.TrimSpace(d)); err == nil && n >= 0 && n <= 6 {
 				jq.config.ProcessDays = append(jq.config.ProcessDays, n)
 			}
@@ -256,26 +259,25 @@ func (jq *JobQueue) AddUpload(path, source, originalName, contentType string, fi
 	}
 
 	// Check if already in main DB
-	var existing int
-	jq.db.QueryRow("SELECT 1 FROM images WHERE hash = ?", hash).Scan(&existing)
-	if existing == 1 {
+	var existingPath string
+	if err := jq.db.QueryRow("SELECT path FROM images WHERE hash = ? LIMIT 1", hash).Scan(&existingPath); err == nil && existingPath != "" {
 		// Still add to queue but mark as duplicate
 		res, err := jq.db.Exec(`
-			INSERT INTO pending_uploads (path, hash, source, status, original_name, file_size, content_type)
-			VALUES (?, ?, ?, 'duplicate', ?, ?, ?)
-		`, path, hash, source, originalName, fileSize, contentType)
+			INSERT INTO pending_uploads (path, hash, source, status, processed_at, error_msg, original_name, file_size, content_type)
+			VALUES (?, ?, ?, 'duplicate', ?, 'already in library', ?, ?, ?)
+		`, existingPath, hash, source, time.Now(), originalName, fileSize, contentType)
 		if err != nil {
 			return nil, err
 		}
 		id, _ := res.LastInsertId()
-		return &PendingUpload{ID: int(id), Hash: hash, Status: "duplicate"}, nil
+		return &PendingUpload{ID: int(id), Path: existingPath, Hash: hash, Source: source, Status: "duplicate", CreatedAt: time.Now(), OriginalName: originalName, FileSize: fileSize, ContentType: contentType}, nil
 	}
 
 	// Check if already pending
 	var pendingID int
-	jq.db.QueryRow("SELECT id FROM pending_uploads WHERE hash = ? AND status = 'pending'", hash).Scan(&pendingID)
+	jq.db.QueryRow("SELECT id FROM pending_uploads WHERE hash = ? AND status IN ('pending', 'processing')", hash).Scan(&pendingID)
 	if pendingID > 0 {
-		return nil, fmt.Errorf("already pending: upload #%d", pendingID)
+		return nil, fmt.Errorf("already queued: upload #%d", pendingID)
 	}
 
 	res, err := jq.db.Exec(`
@@ -309,6 +311,9 @@ func (jq *JobQueue) GetPendingCount() (int, error) {
 
 // GetPendingList returns pending uploads
 func (jq *JobQueue) GetPendingList(limit int) ([]PendingUpload, error) {
+	if limit <= 0 {
+		limit = 25
+	}
 	rows, err := jq.db.Query(`
 		SELECT id, path, hash, source, status, created_at, processed_at, error_msg, priority, original_name, file_size, content_type
 		FROM pending_uploads WHERE status = 'pending' ORDER BY priority DESC, created_at ASC LIMIT ?
@@ -363,10 +368,31 @@ func (jq *JobQueue) ProcessNow(model string) error {
 		return nil
 	}
 
+	modelPath := os.Getenv("FOTORO_MODEL_PATH")
+	if modelPath == "" {
+		modelPath = "./models/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf"
+	}
+	if ok, msg := system.CanStartLLM(modelPath); !ok {
+		return fmt.Errorf("memory guard refused VLM start: %s", msg)
+	}
+
 	fmt.Printf("[SCHEDULER] Processing %d pending uploads...\\n", len(uploads))
 
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, jq.config.MaxConcurrent)
+	workers := jq.config.MaxConcurrent
+	if env := os.Getenv("FOTORO_QUEUE_WORKERS"); env != "" {
+		if n, err := strconv.Atoi(env); err == nil && n > 0 {
+			workers = n
+		}
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if os.Getenv("FOTORO_ALLOW_PARALLEL_VLM") != "1" && workers > 1 {
+		fmt.Printf("[SCHEDULER] Capping VLM workers to 1 for CPU-safe processing (set FOTORO_ALLOW_PARALLEL_VLM=1 to override)\\n")
+		workers = 1
+	}
+	sem := make(chan struct{}, workers)
 
 	for _, upload := range uploads {
 		wg.Add(1)
@@ -400,13 +426,16 @@ func (jq *JobQueue) processUpload(u PendingUpload) {
 		jq.db.QueryRow("SELECT hash FROM images WHERE phash = ?", meta.PHash).Scan(&dupHash)
 		if dupHash != "" {
 			jq.db.Exec("UPDATE pending_uploads SET status = 'duplicate', error_msg = ? WHERE id = ?", "perceptual duplicate", u.ID)
+			if isStagedUploadSource(u.Source) {
+				_ = os.Remove(u.Path)
+			}
 			return
 		}
 	}
 
 	// Save thumbnails
 	if err := validate.SaveThumbnails(jq.cacheDir, meta); err != nil {
-		fmt.Printf("[WARN] thumbs failed for %s: %v\\n", u.Hash[:8], err)
+		fmt.Printf("[WARN] thumbs failed for %s: %v\\n", shortHash(u.Hash), err)
 	}
 
 	// VLM analysis
@@ -445,7 +474,28 @@ func (jq *JobQueue) processUpload(u PendingUpload) {
 
 	// Mark as done
 	jq.db.Exec("UPDATE pending_uploads SET status = 'done', processed_at = ? WHERE id = ?", time.Now(), u.ID)
-	fmt.Printf("[SCHEDULER] Done: %s | %s\\n", u.Hash[:8], analysis.Category)
+	fmt.Printf("[SCHEDULER] Done: %s | %s\\n", shortHash(u.Hash), analysis.Category)
+}
+
+func shortHash(hash string) string {
+	if len(hash) <= 8 {
+		return hash
+	}
+	return hash[:8]
+}
+
+func isStagedUploadSource(source string) bool {
+	return source == "mobile" || source == "web" || source == "scheduler"
+}
+
+func (jq *JobQueue) Config() ScheduleConfig {
+	jq.mu.Lock()
+	defer jq.mu.Unlock()
+	cfg := jq.config
+	if cfg.ProcessDays != nil {
+		cfg.ProcessDays = append([]int(nil), cfg.ProcessDays...)
+	}
+	return cfg
 }
 
 // StartDaemon begins the background scheduler
