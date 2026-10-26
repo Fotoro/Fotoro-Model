@@ -16,6 +16,9 @@ type BackupStatus struct {
 	Configured bool   `json:"configured"`
 	Available  bool   `json:"available"`
 	Error      string `json:"error,omitempty"`
+	Unverified int    `json:"unverified_primary"`
+	Missing    int    `json:"missing_primary"`
+	Corrupt    int    `json:"corrupt_primary"`
 	Pending    int    `json:"pending"`
 	Verified   int    `json:"verified"`
 	Failed     int    `json:"failed"`
@@ -98,6 +101,18 @@ func (s *Service) BackupStatus() (BackupStatus, error) {
 		AND status = 'verified' AND checksum_verified = 1`).Scan(&status.Verified); err != nil {
 		return status, err
 	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM media_assets a
+		LEFT JOIN storage_copies p ON p.media_asset_id = a.id AND p.storage_name = 'primary'
+			AND p.status = 'verified' AND p.checksum_verified = 1
+		WHERE p.id IS NULL`).Scan(&status.Unverified); err != nil {
+		return status, err
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM media_assets WHERE status = 'missing'`).Scan(&status.Missing); err != nil {
+		return status, err
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM media_assets WHERE status = 'corrupt'`).Scan(&status.Corrupt); err != nil {
+		return status, err
+	}
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM storage_copies WHERE storage_name = 'backup'
 		AND status = 'failed'`).Scan(&status.Failed); err != nil {
 		return status, err
@@ -111,6 +126,88 @@ func (s *Service) BackupStatus() (BackupStatus, error) {
 		return status, err
 	}
 	return status, nil
+}
+
+// VerifyPrimaryPending reconciles legacy catalogue rows before they enter the
+// backup queue. An old "verified" flag alone is never accepted as proof.
+func (s *Service) VerifyPrimaryPending(ctx context.Context, limit int) (int, error) {
+	if err := s.primaryAvailable(); err != nil {
+		return 0, err
+	}
+	if limit < 1 || limit > 100 {
+		limit = 10
+	}
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+	rows, err := s.db.Query(`SELECT a.id, a.hash, a.storage_path FROM media_assets a
+		LEFT JOIN storage_copies p ON p.media_asset_id = a.id AND p.storage_name = 'primary'
+			AND p.status = 'verified' AND p.checksum_verified = 1
+		WHERE p.id IS NULL AND a.status != 'corrupt'
+		ORDER BY CASE WHEN a.status = 'missing' THEN 1 ELSE 0 END,
+			a.imported_at, a.id LIMIT ?`, limit)
+	if err != nil {
+		return 0, err
+	}
+	type candidate struct{ id, hash, path string }
+	var candidates []candidate
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.hash, &c.path); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		candidates = append(candidates, c)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, err
+	}
+	verified := 0
+	for _, c := range candidates {
+		if err := ctx.Err(); err != nil {
+			return verified, err
+		}
+		actual, err := hashFile(c.path)
+		if err != nil {
+			_, _ = s.db.Exec(`UPDATE media_assets SET status = 'missing', checksum_verified = 0,
+				updated_at = ? WHERE id = ?`, time.Now().UTC(), c.id)
+			continue
+		}
+		if !isSHA256(c.hash) || !strings.EqualFold(actual, c.hash) {
+			_, _ = s.db.Exec(`UPDATE media_assets SET status = 'corrupt', checksum_verified = 0,
+				updated_at = ? WHERE id = ?`, time.Now().UTC(), c.id)
+			continue
+		}
+		info, err := os.Stat(c.path)
+		if err != nil {
+			continue
+		}
+		now := time.Now().UTC()
+		tx, err := s.db.Begin()
+		if err != nil {
+			return verified, err
+		}
+		_, err = tx.Exec(`UPDATE media_assets SET file_size = ?, checksum_verified = 1,
+			status = 'verified', updated_at = ? WHERE id = ?`, info.Size(), now, c.id)
+		if err == nil {
+			_, err = tx.Exec(`INSERT INTO storage_copies
+				(media_asset_id, storage_name, storage_path, status, checksum_verified, verified_at)
+				VALUES (?, 'primary', ?, 'verified', 1, ?)
+				ON CONFLICT(media_asset_id, storage_name) DO UPDATE SET
+				storage_path = excluded.storage_path, status = 'verified',
+				checksum_verified = 1, verified_at = excluded.verified_at`, c.id, c.path, now)
+		}
+		if err != nil {
+			tx.Rollback()
+			return verified, err
+		}
+		if err := tx.Commit(); err != nil {
+			return verified, err
+		}
+		verified++
+	}
+	return verified, nil
 }
 
 // BackupPending copies a bounded batch. Pending work is reconstructed from
@@ -155,11 +252,70 @@ func (s *Service) BackupPending(ctx context.Context, limit int) (int, error) {
 			return completed, err
 		}
 		if err := s.backupOne(c.id, c.hash, c.path, c.name); err != nil {
+			_, _ = s.db.Exec(`INSERT INTO storage_copies
+				(media_asset_id, storage_name, storage_path, status, checksum_verified)
+				VALUES (?, 'backup', '', 'failed', 0)
+				ON CONFLICT(media_asset_id, storage_name) DO UPDATE SET
+				status = 'failed', checksum_verified = 0`, c.id)
 			return completed, fmt.Errorf("backup %s: %w", c.id, err)
 		}
 		completed++
 	}
 	return completed, nil
+}
+
+// VerifyBackupCopies walks the oldest verified copies first. A failed copy
+// becomes pending again and the next backup pass repairs it from the primary.
+func (s *Service) VerifyBackupCopies(ctx context.Context, limit int) (int, error) {
+	if err := s.backupAvailable(); err != nil {
+		return 0, err
+	}
+	if limit < 1 || limit > 100 {
+		limit = 25
+	}
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+	rows, err := s.db.Query(`SELECT b.media_asset_id, a.hash, b.storage_path
+		FROM storage_copies b JOIN media_assets a ON a.id = b.media_asset_id
+		WHERE b.storage_name = 'backup' AND b.status = 'verified' AND b.checksum_verified = 1
+		ORDER BY b.verified_at, b.media_asset_id LIMIT ?`, limit)
+	if err != nil {
+		return 0, err
+	}
+	type copyRecord struct{ id, hash, path string }
+	var copies []copyRecord
+	for rows.Next() {
+		var record copyRecord
+		if err := rows.Scan(&record.id, &record.hash, &record.path); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		copies = append(copies, record)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, err
+	}
+	checked := 0
+	for _, record := range copies {
+		if err := ctx.Err(); err != nil {
+			return checked, err
+		}
+		actual, err := hashFile(record.path)
+		if err != nil || !strings.EqualFold(actual, record.hash) {
+			_, err = s.db.Exec(`UPDATE storage_copies SET status = 'failed', checksum_verified = 0,
+				verified_at = NULL WHERE media_asset_id = ? AND storage_name = 'backup'`, record.id)
+		} else {
+			_, err = s.db.Exec(`UPDATE storage_copies SET verified_at = ?
+				WHERE media_asset_id = ? AND storage_name = 'backup'`, time.Now().UTC(), record.id)
+		}
+		if err != nil {
+			return checked, err
+		}
+		checked++
+	}
+	return checked, nil
 }
 
 func (s *Service) backupOne(id, expectedHash, source, originalName string) error {

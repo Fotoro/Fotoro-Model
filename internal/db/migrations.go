@@ -139,6 +139,7 @@ func (d *DB) ExtendedMigrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_media_assets_imported ON media_assets(imported_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_media_assets_kind ON media_assets(media_kind)`,
 		`CREATE INDEX IF NOT EXISTS idx_media_assets_captured ON media_assets(captured_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_media_assets_timeline ON media_assets(COALESCE(captured_at, imported_at) DESC, id DESC)`,
 		`CREATE TABLE IF NOT EXISTS device_assets (
 			device_id TEXT NOT NULL,
 			device_asset_id TEXT NOT NULL,

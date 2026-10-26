@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"fotoro/internal/db"
@@ -202,11 +203,21 @@ func (s *Service) ImportFile(sourcePath string, opts ImportOptions) (*ImportResu
 		if storedHash, hashErr := hashFile(storedPath); hashErr != nil || storedHash != hash {
 			return nil, fmt.Errorf("existing original failed verification")
 		}
+		if _, err := s.db.Exec(`INSERT INTO storage_copies
+			(media_asset_id, storage_name, storage_path, status, checksum_verified, verified_at)
+			VALUES (?, 'primary', ?, 'verified', 1, ?)
+			ON CONFLICT(media_asset_id, storage_name) DO UPDATE SET
+			storage_path = excluded.storage_path, status = 'verified',
+			checksum_verified = 1, verified_at = excluded.verified_at`,
+			existing.ID, storedPath, time.Now().UTC()); err != nil {
+			return nil, err
+		}
 		if err := s.linkDeviceAsset(existing.ID, opts, info.Size(), hash); err != nil {
 			return nil, err
 		}
-		if opts.MoveSource && !sameFilePath(sourcePath, s.assetStoragePath(existing.ID, existing.OriginalName)) {
-			_ = os.Remove(sourcePath)
+		existing, err = s.GetAsset(existing.ID)
+		if err != nil {
+			return nil, err
 		}
 		return &ImportResult{Asset: existing, Duplicate: true}, nil
 	}
@@ -221,7 +232,8 @@ func (s *Service) ImportFile(sourcePath string, opts ImportOptions) (*ImportResu
 	if err := os.MkdirAll(filepath.Dir(destination), 0750); err != nil {
 		return nil, err
 	}
-	created, err := materializeOriginal(sourcePath, destination, opts.MoveSource)
+	// Keep staging intact until the asset and upload session are committed.
+	created, err := materializeOriginal(sourcePath, destination, false)
 	if err != nil {
 		return nil, err
 	}
@@ -233,7 +245,15 @@ func (s *Service) ImportFile(sourcePath string, opts ImportOptions) (*ImportResu
 	}
 
 	now := time.Now().UTC()
-	_, err = s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		if created {
+			_ = os.Remove(destination)
+		}
+		return nil, err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`
 		INSERT INTO media_assets (
 			id, hash, original_name, storage_path, media_kind, mime_type, file_size,
 			status, imported_at, checksum_verified, preview_status,
@@ -248,13 +268,22 @@ func (s *Service) ImportFile(sourcePath string, opts ImportOptions) (*ImportResu
 		return nil, err
 	}
 
-	_, err = s.db.Exec(`
+	_, err = tx.Exec(`
 		INSERT OR REPLACE INTO storage_copies (
 			media_asset_id, storage_name, storage_path, status,
 			checksum_verified, verified_at, created_at
 		) VALUES (?, 'primary', ?, 'verified', 1, ?, ?)
 	`, hash, destination, now, now)
 	if err != nil {
+		if created {
+			_ = os.Remove(destination)
+		}
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		if created {
+			_ = os.Remove(destination)
+		}
 		return nil, err
 	}
 	if err := s.linkDeviceAsset(hash, opts, info.Size(), hash); err != nil {
@@ -350,7 +379,7 @@ func (s *Service) linkDeviceAsset(assetID string, opts ImportOptions, size int64
 	return err
 }
 
-func (s *Service) ListAssets(page, limit int, kind string) ([]Asset, int, error) {
+func (s *Service) ListAssets(page, limit int, kind, deviceID, month string) ([]Asset, int, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -359,18 +388,17 @@ func (s *Service) ListAssets(page, limit int, kind string) ([]Asset, int, error)
 	}
 	offset := (page - 1) * limit
 	var total int
+	where := ` WHERE (? = '' OR media_kind = ?)
+		AND (? = '' OR strftime('%Y-%m', COALESCE(captured_at, imported_at)) = ?)
+		AND (? = '' OR EXISTS (SELECT 1 FROM device_assets da
+			WHERE da.media_asset_id = media_assets.id AND da.device_id = ?))`
+	args := []interface{}{kind, kind, month, month, deviceID, deviceID}
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM media_assets`+where, args...).Scan(&total)
 	var rows *sql.Rows
-	var err error
-	if kind != "" {
-		err = s.db.QueryRow(`SELECT COUNT(*) FROM media_assets WHERE media_kind = ?`, kind).Scan(&total)
-		if err == nil {
-			rows, err = s.db.Query(assetSelect+` WHERE media_kind = ? ORDER BY COALESCE(captured_at, imported_at) DESC LIMIT ? OFFSET ?`, kind, limit, offset)
-		}
-	} else {
-		err = s.db.QueryRow(`SELECT COUNT(*) FROM media_assets`).Scan(&total)
-		if err == nil {
-			rows, err = s.db.Query(assetSelect+` ORDER BY COALESCE(captured_at, imported_at) DESC LIMIT ? OFFSET ?`, limit, offset)
-		}
+	if err == nil {
+		rows, err = s.db.Query(assetSelect+where+`
+			ORDER BY COALESCE(captured_at, imported_at) DESC, id DESC LIMIT ? OFFSET ?`,
+			append(args, limit, offset)...)
 	}
 	if err != nil {
 		return nil, 0, err
@@ -512,6 +540,9 @@ func (s *Service) CreateUpload(ownerID string, req CreateUploadRequest) (*Upload
 	}
 	if req.ExpectedSize < 0 || req.ExpectedSize > s.maxSize {
 		return nil, fmt.Errorf("invalid or oversized asset")
+	}
+	if err := s.ensureCapacity(req.ExpectedSize); err != nil {
+		return nil, err
 	}
 	if req.ExpectedSHA256 != "" && !isSHA256(req.ExpectedSHA256) {
 		return nil, fmt.Errorf("sha256 must be a 64-character hexadecimal value")
@@ -659,14 +690,34 @@ func (s *Service) CompleteUpload(id, ownerID string) (*ImportResult, error) {
 		MoveSource:    true,
 	})
 	if err != nil {
-		_, _ = s.db.Exec(`UPDATE upload_sessions SET status = 'failed', error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, err.Error(), id)
+		_, _ = s.db.Exec(`UPDATE upload_sessions SET error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, err.Error(), id)
 		return nil, err
 	}
 	_, err = s.db.Exec(`
 		UPDATE upload_sessions SET status = 'completed', media_asset_id = ?,
 			received_size = expected_size, error_message = NULL, updated_at = ? WHERE id = ?
 	`, result.Asset.ID, time.Now().UTC(), id)
+	if err == nil {
+		_ = os.Remove(u.TempPath)
+	}
 	return result, err
+}
+
+func (s *Service) ensureCapacity(expectedSize int64) error {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(s.storageRoot, &st); err != nil {
+		return err
+	}
+	free := uint64(st.Bavail) * uint64(st.Bsize)
+	total := uint64(st.Blocks) * uint64(st.Bsize)
+	reserve := total * 15 / 100
+	if reserve < 1<<30 {
+		reserve = 1 << 30
+	}
+	if free < reserve || uint64(expectedSize) > free-reserve {
+		return fmt.Errorf("primary storage does not have enough free space")
+	}
+	return nil
 }
 
 func (s *Service) CancelUpload(id, ownerID string) error {

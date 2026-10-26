@@ -22,6 +22,7 @@ func registerMediaV1Routes(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("/api/v1/media/", s.withAuth(s.handleMediaItem))
 	mux.HandleFunc("/api/v1/uploads", s.withAuth(s.handleUploadCollection))
 	mux.HandleFunc("/api/v1/uploads/", s.withAuth(s.handleUploadItem))
+	mux.HandleFunc("/api/v1/device-assets/status", s.withAuth(s.handleDeviceAssetStatus))
 	mux.HandleFunc("/api/v1/me", s.withAuth(s.handleV1Me))
 }
 
@@ -32,8 +33,8 @@ func (s *Server) handleV1Me(w http.ResponseWriter, r *http.Request) {
 	}
 	user := auth.UserFromRequest(r)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"user":      user,
-		"device_id": deviceIDFromUser(user),
+		"user":        user,
+		"device_id":   deviceIDFromUser(user),
 		"api_version": "v1",
 	})
 }
@@ -46,7 +47,13 @@ func (s *Server) handleMediaList(w http.ResponseWriter, r *http.Request) {
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	kind := strings.TrimSpace(r.URL.Query().Get("kind"))
-	assets, total, err := s.media.ListAssets(page, limit, kind)
+	month := strings.TrimSpace(r.URL.Query().Get("month"))
+	if month != "" && (len(month) != 7 || month[4] != '-') {
+		http.Error(w, `{"error":"month must be YYYY-MM"}`, http.StatusBadRequest)
+		return
+	}
+	deviceID := strings.TrimSpace(r.URL.Query().Get("device_id"))
+	assets, total, err := s.media.ListAssets(page, limit, kind, deviceID, month)
 	if err != nil {
 		http.Error(w, `{"error":"could not list media"}`, http.StatusInternalServerError)
 		return

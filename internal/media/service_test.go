@@ -86,12 +86,25 @@ func TestResumableUploadAndBackup(t *testing.T) {
 	if err != nil || !asset.SafeToDelete || asset.StorageCopies != 2 {
 		t.Fatalf("expected two verified copies: asset=%+v err=%v", asset, err)
 	}
-	if err := os.Remove(filepath.Join(backup, "originals", hash[:2], hash+".jpg")); err != nil {
+	backupPath := filepath.Join(backup, "originals", hash[:2], hash+".jpg")
+	if err := os.WriteFile(backupPath, []byte("corrupted"), 0600); err != nil {
 		t.Fatal(err)
+	}
+	checked, err := s.VerifyBackupCopies(context.Background(), 10)
+	if err != nil || checked != 1 {
+		t.Fatalf("integrity scan: checked=%d err=%v", checked, err)
 	}
 	asset, err = s.GetAsset(hash)
 	if err != nil || asset.SafeToDelete {
-		t.Fatalf("missing secondary must not be safe: asset=%+v err=%v", asset, err)
+		t.Fatalf("corrupt secondary must not be safe: asset=%+v err=%v", asset, err)
+	}
+	count, err = s.BackupPending(context.Background(), 10)
+	if err != nil || count != 1 {
+		t.Fatalf("repair pass: count=%d err=%v", count, err)
+	}
+	asset, err = s.GetAsset(hash)
+	if err != nil || !asset.SafeToDelete {
+		t.Fatalf("repaired secondary should be safe: asset=%+v err=%v", asset, err)
 	}
 }
 
@@ -112,5 +125,33 @@ func TestHashMismatchNeverCommitsOriginal(t *testing.T) {
 	var count int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM media_assets`).Scan(&count); err != nil || count != 0 {
 		t.Fatalf("mismatched upload committed: count=%d err=%v", count, err)
+	}
+}
+
+func TestLegacyRowRequiresRealPrimaryVerification(t *testing.T) {
+	s := newTestService(t)
+	contents := []byte("legacy original")
+	digest := sha256.Sum256(contents)
+	hash := hex.EncodeToString(digest[:])
+	path := filepath.Join(t.TempDir(), "legacy.jpg")
+	if err := os.WriteFile(path, contents, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO media_assets
+		(id, hash, original_name, storage_path, media_kind, file_size, checksum_verified)
+		VALUES (?, ?, 'legacy.jpg', ?, 'image', 0, 1)`, hash, hash, path); err != nil {
+		t.Fatal(err)
+	}
+	asset, err := s.GetAsset(hash)
+	if err != nil || asset.StorageCopies != 0 || asset.SafeToDelete {
+		t.Fatalf("backfill flag is not copy proof: asset=%+v err=%v", asset, err)
+	}
+	verified, err := s.VerifyPrimaryPending(context.Background(), 10)
+	if err != nil || verified != 1 {
+		t.Fatalf("primary verification: count=%d err=%v", verified, err)
+	}
+	asset, err = s.GetAsset(hash)
+	if err != nil || asset.FileSize != int64(len(contents)) || asset.StorageCopies != 1 {
+		t.Fatalf("legacy reconciliation: asset=%+v err=%v", asset, err)
 	}
 }

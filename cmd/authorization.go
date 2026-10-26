@@ -32,6 +32,7 @@ func (s *Server) authorizeUser(r *http.Request, user *auth.User) error {
 		path := r.URL.Path
 		if !(path == "/api/v1/media" || strings.HasPrefix(path, "/api/v1/media/") ||
 			path == "/api/v1/uploads" || strings.HasPrefix(path, "/api/v1/uploads/") ||
+			path == "/api/v1/device-assets/status" ||
 			path == "/api/v1/me") {
 			return fmt.Errorf("device cannot access this endpoint")
 		}

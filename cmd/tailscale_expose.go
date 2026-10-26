@@ -36,31 +36,43 @@ func ensureTailscaleExpose(s *Server, addr string) {
 	fmt.Printf("[TAILSCALE] Exposing API on your tailnet (port %d)…\n", port)
 
 	publicURL := ""
+	tailnetURL := ""
+	serveEnabled := false
+	funnelEnabled := false
 	if err := ts.SetupServe(port); err != nil {
 		fmt.Printf("[WARN] tailscale serve failed: %v\n", err)
 		fmt.Printf("[HINT] Run manually: sudo tailscale serve --bg %d\n", port)
 	} else if url, err := ts.GetTailnetURL(); err == nil {
-		publicURL = url
+		serveEnabled = true
+		tailnetURL = tailscale.NormalizeServerURL(url)
 		fmt.Printf("[TAILSCALE] Tailnet URL: %s\n", url)
 	}
 
-	if os.Getenv("FOTORO_FUNNEL") != "0" {
+	if os.Getenv("FOTORO_FUNNEL") == "1" {
 		fmt.Printf("[TAILSCALE] Enabling public Funnel on port %d…\n", port)
 		if err := ts.SetupFunnel(port); err != nil {
 			fmt.Printf("[WARN] tailscale funnel failed: %v\n", err)
 			fmt.Printf("[HINT] Enable Funnel in Tailscale admin ACL, then: sudo tailscale funnel --bg %d\n", port)
 		} else if url, err := ts.GetPublicURL(); err == nil {
+			funnelEnabled = true
 			publicURL = url
 			fmt.Printf("[TAILSCALE] Public URL: %s\n", url)
 		}
 	}
 
-	if s.db != nil && publicURL != "" {
-		publicURL = tailscale.NormalizeServerURL(publicURL)
-		_ = s.db.UpdateServerConfig(map[string]interface{}{
-			"public_url":        publicURL,
-			"tailnet_serve_url": publicURL,
-		})
+	if s.db != nil && (publicURL != "" || tailnetURL != "" || serveEnabled || funnelEnabled) {
+		updates := map[string]interface{}{
+			"serve_enabled":  boolToInt(serveEnabled),
+			"funnel_enabled": boolToInt(funnelEnabled),
+			"public_url":     "",
+		}
+		if publicURL != "" {
+			updates["public_url"] = tailscale.NormalizeServerURL(publicURL)
+		}
+		if tailnetURL != "" {
+			updates["tailnet_serve_url"] = tailnetURL
+		}
+		_ = s.db.UpdateServerConfig(updates)
 		go s.syncNodeToCloud()
 	}
 }
