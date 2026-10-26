@@ -20,11 +20,8 @@ func syncNodeAfterSetup(database *db.DB, accessToken, ip, tailnet, magicDNS, nod
 	cfg, _ := database.GetServerConfig()
 	publicURL := configString(cfg, "public_url")
 	tailnetURL := configString(cfg, "tailnet_serve_url")
-	if tailnetURL == "" {
-		tailnetURL = publicURL
-	}
-	if publicURL == "" && magicDNS != "" {
-		publicURL = "https://" + magicDNS
+	if tailnetURL == "" && magicDNS != "" {
+		tailnetURL = "https://" + magicDNS
 	}
 
 	err := cloudsync.SyncNode(accessToken, cloudsync.NodeInfo{
@@ -72,7 +69,23 @@ func RunNodeSyncCLI(dbPath string) {
 		fmt.Printf("Sync failed: %v\n", err)
 		os.Exit(1)
 	}
+	cfg, _ := database.GetServerConfig()
 	fmt.Println("Node synced to dashboard.")
+	fmt.Println("Website:", cloudsync.WebAPIBase())
+	publicURL := configString(cfg, "public_url")
+	if publicURL == "" && ts.FunnelConfigured() {
+		if magicDNS, err := ts.GetMagicDNS(); err == nil && magicDNS != "" {
+			publicURL = tailscale.PublicURL(magicDNS)
+		}
+	}
+	if publicURL != "" {
+		fmt.Println("Public URL:", publicURL)
+	} else {
+		fmt.Println("Public URL: not set (private tailnet mode)")
+	}
+	if tailnetURL := configString(cfg, "tailnet_serve_url"); tailnetURL != "" {
+		fmt.Println("Tailnet URL:", tailnetURL)
+	}
 }
 
 func configString(m map[string]interface{}, key string) string {

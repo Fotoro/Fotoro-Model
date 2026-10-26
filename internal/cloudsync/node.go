@@ -138,11 +138,8 @@ func SyncNodeFromDB(database *db.DB) error {
 		PublicURL:   tailscale.NormalizeServerURL(stringField(cfg, "public_url")),
 		TailnetURL:  stringField(cfg, "tailnet_serve_url"),
 	}
-	if node.TailnetURL == "" {
-		node.TailnetURL = node.PublicURL
-	}
-	if node.PublicURL == "" && node.MagicDNS != "" {
-		node.PublicURL = tailscale.PublicURL(node.MagicDNS)
+	if node.TailnetURL == "" && node.MagicDNS != "" {
+		node.TailnetURL = tailscale.PublicURL(node.MagicDNS)
 	}
 	if node.NodeName == "" {
 		node.NodeName = "fotoro-server"
@@ -175,35 +172,49 @@ func SyncNodeLive(database *db.DB, ts *tailscale.Manager) error {
 		return err
 	}
 	if cfg != nil {
-		if u := stringField(cfg, "public_url"); u != "" {
-			node.PublicURL = u
-		}
 		if u := stringField(cfg, "tailnet_serve_url"); u != "" {
-			node.TailnetURL = u
+			node.TailnetURL = tailscale.NormalizeServerURL(u)
 		}
 	}
-	if node.PublicURL == "" {
-		if url, err := ts.GetPublicURL(); err == nil {
-			node.PublicURL = url
-		} else if url, err := ts.GetTailnetURL(); err == nil {
-			node.PublicURL = url
-		}
-	}
-	if node.PublicURL == "" && node.MagicDNS != "" {
+	if u := strings.TrimSpace(os.Getenv("FOTORO_PUBLIC_URL")); u != "" {
+		node.PublicURL = tailscale.NormalizeServerURL(u)
+	} else if url, err := ts.GetPublicURL(); err == nil {
+		node.PublicURL = tailscale.NormalizeServerURL(url)
+	} else if ts.FunnelConfigured() && node.MagicDNS != "" {
 		node.PublicURL = tailscale.PublicURL(node.MagicDNS)
+	} else if cfg != nil && os.Getenv("FOTORO_TRUST_STORED_PUBLIC_URL") == "1" {
+		node.PublicURL = tailscale.NormalizeServerURL(stringField(cfg, "public_url"))
 	}
 	if node.TailnetURL == "" {
-		node.TailnetURL = node.PublicURL
+		if url, err := ts.GetTailnetURL(); err == nil {
+			node.TailnetURL = tailscale.NormalizeServerURL(url)
+		} else if node.MagicDNS != "" {
+			node.TailnetURL = tailscale.PublicURL(node.MagicDNS)
+		}
 	}
 	if err := SyncNode(accessToken, node); err != nil {
 		return err
 	}
-	_ = database.UpdateServerConfig(map[string]interface{}{
+	updates := map[string]interface{}{
 		"tailscale_enabled": 1,
 		"tailscale_ip":      node.TailscaleIP,
 		"tailnet_name":      node.TailnetName,
 		"tailnet_url":       node.MagicDNS,
 		"server_name":       node.NodeName,
-	})
+		"tailnet_serve_url": node.TailnetURL,
+		"funnel_enabled":    boolToInt(node.PublicURL != ""),
+		"serve_enabled":     boolToInt(node.TailnetURL != ""),
+	}
+	if node.PublicURL != "" {
+		updates["public_url"] = node.PublicURL
+	}
+	_ = database.UpdateServerConfig(updates)
 	return nil
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
