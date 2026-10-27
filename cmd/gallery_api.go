@@ -10,8 +10,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 
 	"fotoro/internal/auth"
@@ -348,82 +346,29 @@ func num(v interface{}) float64 {
 }
 
 func (s *Server) handleGalleryLibraryStats(w http.ResponseWriter, r *http.Request) {
-	if body, ok := readGalleryStatsCache(); ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Cache", "HIT")
-		w.Write(body)
+	metrics, err := s.dashboardMetrics(r.Context())
+	if err != nil {
+		http.Error(w, `{"error":"metrics unavailable"}`, http.StatusServiceUnavailable)
 		return
 	}
-
-	var total, processed, failed, thumbs int
-	_ = s.db.QueryRow("SELECT COUNT(*) FROM images").Scan(&total)
-	_ = s.db.QueryRow("SELECT COUNT(*) FROM images WHERE category = 'failed'").Scan(&failed)
-	processed = total - failed
-
-	mediumDir := filepath.Join(s.cacheDir, "thumbnails", "medium")
-	_ = filepath.Walk(mediumDir, func(path string, info os.FileInfo, err error) error {
-		if err == nil && info != nil && !info.IsDir() && strings.HasSuffix(path, ".jpg") {
-			thumbs++
-		}
-		return nil
+	w.Header().Set("Cache-Control", "private, no-store")
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"photos_total":       metrics.Total,
+		"photos_processed":   metrics.Processed,
+		"photos_failed":      metrics.Failed,
+		"thumbnails_medium":  metrics.ThumbnailsMedium,
+		"storage_used_bytes": metrics.StorageUsedBytes,
+		"disk_total_bytes":   metrics.DiskTotalBytes,
+		"disk_free_bytes":    metrics.DiskFreeBytes,
+		"devices_count":      metrics.DevicesCount,
+		"photos_with_faces":  metrics.PhotosWithFaces,
+		"queue_pending":      metrics.QueuePending,
+		"queue_failed":       metrics.QueueFailed,
+		"search_vectors":     metrics.SearchVectors,
+		"backup_verified":    metrics.BackupVerified,
+		"backup_pending":     metrics.BackupPending,
+		"collected_at":       metrics.CollectedAt,
 	})
-
-	baseDir := filepath.Dir(s.dbPath())
-	if baseDir == "" || baseDir == "." {
-		baseDir = "."
-	}
-	used := dirSizeBytes(filepath.Join(baseDir, ".cache")) + dirSizeBytes(filepath.Join(baseDir, "uploads"))
-
-	var diskTotal, diskFree uint64
-	if stat, err := statfs(baseDir); err == nil {
-		diskTotal = stat.Total
-		diskFree = stat.Free
-	}
-
-	var deviceCount int
-	_ = s.db.QueryRow("SELECT COUNT(*) FROM mobile_devices WHERE is_active = 1").Scan(&deviceCount)
-	deviceCount++ // this server node
-
-	w.Header().Set("Content-Type", "application/json")
-	body, _ := json.Marshal(map[string]interface{}{
-		"photos_total":       total,
-		"photos_processed":   processed,
-		"photos_failed":      failed,
-		"thumbnails_medium":  thumbs,
-		"storage_used_bytes": used,
-		"disk_total_bytes":   diskTotal,
-		"disk_free_bytes":    diskFree,
-		"devices_count":      deviceCount,
-		"people_count":       nil,
-		"places_count":       nil,
-		"ai_queue_pct":       nil,
-	})
-	storeGalleryStatsCache(body)
-	w.Write(body)
-}
-
-var (
-	galleryStatsCacheMu sync.RWMutex
-	galleryStatsCache   []byte
-	galleryStatsCacheAt time.Time
-)
-
-func readGalleryStatsCache() ([]byte, bool) {
-	galleryStatsCacheMu.RLock()
-	defer galleryStatsCacheMu.RUnlock()
-	if galleryStatsCache == nil || time.Since(galleryStatsCacheAt) > 45*time.Second {
-		return nil, false
-	}
-	out := make([]byte, len(galleryStatsCache))
-	copy(out, galleryStatsCache)
-	return out, true
-}
-
-func storeGalleryStatsCache(body []byte) {
-	galleryStatsCacheMu.Lock()
-	defer galleryStatsCacheMu.Unlock()
-	galleryStatsCache = append(galleryStatsCache[:0], body...)
-	galleryStatsCacheAt = time.Now()
 }
 
 func (s *Server) handleGalleryDevices(w http.ResponseWriter, r *http.Request) {
@@ -486,40 +431,17 @@ func (s *Server) handleGalleryDevices(w http.ResponseWriter, r *http.Request) {
 			if lastSeen.Valid {
 				d.LastSeen = lastSeen.Time.UTC().Format(time.RFC3339)
 			}
-			d.Items = fmt.Sprintf("%d items", items)
+			unit := "items"
+			if items == 1 {
+				unit = "item"
+			}
+			d.Items = fmt.Sprintf("%d %s", items, unit)
 			devices = append(devices, d)
 		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"devices": devices})
-}
-
-func dirSizeBytes(root string) int64 {
-	var size int64
-	_ = filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
-		if err == nil && info != nil && !info.IsDir() {
-			size += info.Size()
-		}
-		return nil
-	})
-	return size
-}
-
-type diskStat struct {
-	Total uint64
-	Free  uint64
-}
-
-func statfs(path string) (diskStat, error) {
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(path, &st); err != nil {
-		return diskStat{}, err
-	}
-	return diskStat{
-		Total: st.Blocks * uint64(st.Bsize),
-		Free:  st.Bavail * uint64(st.Bsize),
-	}, nil
 }
 
 func (s *Server) dbPath() string {

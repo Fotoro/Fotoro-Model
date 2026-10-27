@@ -879,17 +879,6 @@ func statsDiskUsage(path string) (statsDiskStat, error) {
 	}, nil
 }
 
-func statsDirSizeBytes(root string) int64 {
-	var size int64
-	_ = filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
-		if err == nil && info != nil && !info.IsDir() {
-			size += info.Size()
-		}
-		return nil
-	})
-	return size
-}
-
 func (s *Server) handleWebUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"POST only"}`, http.StatusMethodNotAllowed)

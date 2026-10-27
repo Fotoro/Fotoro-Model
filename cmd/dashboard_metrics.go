@@ -83,6 +83,10 @@ func (s *Server) collectDashboardMetrics(ctx context.Context) (DashboardMetrics,
 		FROM media_assets`).Scan(&m.Total, &m.Processed, &m.Failed); err != nil {
 		return m, fmt.Errorf("media counts: %w", err)
 	}
+	var cataloguedBytes int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(file_size), 0) FROM media_assets WHERE status = 'verified'`).Scan(&cataloguedBytes); err != nil {
+		return m, fmt.Errorf("media size: %w", err)
+	}
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM images WHERE has_faces = 1`).Scan(&m.PhotosWithFaces); err != nil {
 		return m, fmt.Errorf("face counts: %w", err)
 	}
@@ -122,10 +126,6 @@ func (s *Server) collectDashboardMetrics(ctx context.Context) (DashboardMetrics,
 		m.BackupVerified = backup.Verified
 		m.BackupPending = backup.Pending
 	}
-	originalBytes, _, err := scanDashboardFiles(storageRoot, false)
-	if err != nil {
-		return m, fmt.Errorf("storage usage: %w", err)
-	}
 	cacheBytes, mediumCount, err := scanDashboardFiles(s.cacheDir, true)
 	if err != nil {
 		return m, fmt.Errorf("cache usage: %w", err)
@@ -134,7 +134,9 @@ func (s *Server) collectDashboardMetrics(ctx context.Context) (DashboardMetrics,
 	if err != nil {
 		return m, fmt.Errorf("staging usage: %w", err)
 	}
-	m.StorageUsedBytes = originalBytes + cacheBytes + stagingBytes
+	// Original sizes are written to the catalogue at ingestion. Walking every
+	// original on each refresh would compete with thumbnail and video reads.
+	m.StorageUsedBytes = cataloguedBytes + cacheBytes + stagingBytes
 	m.ThumbnailsMedium = mediumCount
 	if disk, err := statsDiskUsage(storageRoot); err == nil {
 		m.DiskTotalBytes = disk.Total
