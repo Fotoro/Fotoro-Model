@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 func (d *DB) migrateVersioned(path string, existing bool) error {
 	var version int
@@ -19,6 +19,12 @@ func (d *DB) migrateVersioned(path string, existing bool) error {
 	if version == currentSchemaVersion {
 		return nil
 	}
+	if version == 1 {
+		if err := d.migrateDashboardMetrics(); err != nil {
+			return err
+		}
+		return d.recordSchemaVersion()
+	}
 	if existing {
 		if err := d.snapshotBeforeMigration(path); err != nil {
 			return err
@@ -29,6 +35,9 @@ func (d *DB) migrateVersioned(path string, existing bool) error {
 	}
 	if err := d.ExtendedMigrate(); err != nil {
 		return fmt.Errorf("migrate media schema: %w", err)
+	}
+	if err := d.migrateDashboardMetrics(); err != nil {
+		return err
 	}
 	var unmatched int
 	if err := d.QueryRow(`SELECT COUNT(*) FROM images i
@@ -42,8 +51,23 @@ func (d *DB) migrateVersioned(path string, existing bool) error {
 	if err := d.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil || integrity != "ok" {
 		return fmt.Errorf("migration integrity check failed: %s: %v", integrity, err)
 	}
+	return d.recordSchemaVersion()
+}
+
+func (d *DB) recordSchemaVersion() error {
 	if _, err := d.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, currentSchemaVersion)); err != nil {
 		return fmt.Errorf("record schema version: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) migrateDashboardMetrics() error {
+	if _, err := d.Exec(`CREATE TABLE IF NOT EXISTS dashboard_metrics (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		payload TEXT NOT NULL,
+		collected_at INTEGER NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create dashboard metrics: %w", err)
 	}
 	return nil
 }

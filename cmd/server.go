@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
@@ -41,6 +42,7 @@ type Server struct {
 	supabaseAuth     *auth.SupabaseAuth
 	tailscale        *tailscale.Manager
 	model            string
+	metricsMu        sync.Mutex
 	serverMu         sync.RWMutex
 	running          bool
 	authMu           sync.RWMutex
@@ -122,6 +124,15 @@ func RunServer(addr, dbPath, model string) {
 		model:        model,
 	}
 	s.loadStoredSession()
+	go func() {
+		// Keep the local SQLite snapshot fresh even when no dashboard is open.
+		_, _ = s.dashboardMetrics(context.Background())
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			_, _ = s.dashboardMetrics(context.Background())
+		}
+	}()
 
 	// Register node with website dashboard + periodic heartbeat
 	if complete, _ := database.IsSetupComplete(); complete {
@@ -839,60 +850,17 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	var total, processed, failed, thumbs int
-	s.db.QueryRow("SELECT COUNT(*) FROM images").Scan(&total)
-	s.db.QueryRow("SELECT COUNT(*) FROM images WHERE category = 'failed'").Scan(&failed)
-	processed = total - failed
-
-	mediumDir := filepath.Join(s.cacheDir, "thumbnails", "medium")
-	_ = filepath.Walk(mediumDir, func(path string, info os.FileInfo, err error) error {
-		if err == nil && info != nil && !info.IsDir() && strings.HasSuffix(path, ".jpg") {
-			thumbs++
-		}
-		return nil
-	})
-
-	baseDir := filepath.Dir(s.cacheDir)
-	if baseDir == "" || baseDir == "." {
-		baseDir = "."
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"GET only"}`, http.StatusMethodNotAllowed)
+		return
 	}
-	used := statsDirSizeBytes(filepath.Join(baseDir, ".cache")) + statsDirSizeBytes(filepath.Join(baseDir, "uploads"))
-
-	var diskTotal, diskFree uint64
-	if stat, err := statsDiskUsage(baseDir); err == nil {
-		diskTotal = stat.Total
-		diskFree = stat.Free
+	metrics, err := s.dashboardMetrics(r.Context())
+	if err != nil {
+		http.Error(w, `{"error":"metrics unavailable"}`, http.StatusServiceUnavailable)
+		return
 	}
-
-	var deviceCount int
-	_ = s.db.QueryRow("SELECT COUNT(*) FROM mobile_devices WHERE is_active = 1").Scan(&deviceCount)
-	deviceCount++
-
-	var queuePct interface{}
-	if s.queue != nil {
-		if stats, err := s.queue.GetStats(); err == nil {
-			pending, _ := stats["pending"].(int)
-			totalQ, _ := stats["total"].(int)
-			if totalQ > 0 {
-				queuePct = int(math.Round(float64(pending) / float64(totalQ) * 100))
-			}
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"total":              total,
-		"processed":          processed,
-		"failed":             failed,
-		"thumbnails_medium":  thumbs,
-		"storage_used_bytes": used,
-		"disk_total_bytes":   diskTotal,
-		"disk_free_bytes":    diskFree,
-		"devices_count":      deviceCount,
-		"people_count":       nil,
-		"places_count":       nil,
-		"ai_queue_pct":       queuePct,
-	})
+	w.Header().Set("Cache-Control", "private, no-store")
+	writeJSON(w, http.StatusOK, metrics)
 }
 
 type statsDiskStat struct {

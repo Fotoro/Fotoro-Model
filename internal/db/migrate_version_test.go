@@ -50,3 +50,38 @@ func TestLegacyMigrationCreatesRestorableSnapshot(t *testing.T) {
 		t.Fatalf("snapshot media count = %d, error = %v", count, err)
 	}
 }
+
+func TestVersionOneAddsDashboardMetricsWithoutChangingMedia(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fotoro.db")
+	database, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO media_assets (id, hash, original_name, storage_path)
+		VALUES (?, ?, 'photo.jpg', '/photo.jpg')`, strings.Repeat("a", 64), strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`DROP TABLE dashboard_metrics`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`PRAGMA user_version = 1`); err != nil {
+		t.Fatal(err)
+	}
+	database.Close()
+
+	database, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var count, version int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM media_assets`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("media count = %d, error = %v", count, err)
+	}
+	if err := database.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != currentSchemaVersion {
+		t.Fatalf("version = %d, error = %v", version, err)
+	}
+	if _, err := database.Exec(`INSERT INTO dashboard_metrics (id, payload, collected_at) VALUES (1, '{}', 1)`); err != nil {
+		t.Fatalf("metrics table missing: %v", err)
+	}
+}

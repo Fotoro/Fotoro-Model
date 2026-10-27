@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -455,28 +456,37 @@ func (s *Server) handleGalleryDevices(w http.ResponseWriter, r *http.Request) {
 	})
 
 	rows, err := s.db.Query(`
-		SELECT device_id, device_name, platform, last_seen, is_active
-		FROM mobile_devices ORDER BY last_seen DESC`)
+		SELECT d.device_id, d.device_name, d.platform, d.last_seen, d.is_active,
+			COALESCE(a.items, 0)
+		FROM mobile_devices d
+		LEFT JOIN (
+			SELECT device_id, COUNT(DISTINCT media_asset_id) AS items
+			FROM device_assets WHERE media_asset_id IS NOT NULL GROUP BY device_id
+		) a ON a.device_id = d.device_id
+		ORDER BY d.last_seen DESC`)
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
 			var d device
-			var lastSeen time.Time
+			var lastSeen sql.NullTime
 			var active int
-			var platform *string
-			rows.Scan(&d.ID, &d.Name, &platform, &lastSeen, &active)
-			if platform != nil {
-				d.Platform = *platform
+			var platform sql.NullString
+			var items int
+			if err := rows.Scan(&d.ID, &d.Name, &platform, &lastSeen, &active, &items); err != nil {
+				continue
 			}
-			if active == 1 {
+			if platform.Valid {
+				d.Platform = platform.String
+			}
+			if active == 1 && lastSeen.Valid && time.Since(lastSeen.Time) < 5*time.Minute {
 				d.Status = "active"
 			} else {
 				d.Status = "idle"
 			}
-			if !lastSeen.IsZero() {
-				d.LastSeen = lastSeen.UTC().Format(time.RFC3339)
+			if lastSeen.Valid {
+				d.LastSeen = lastSeen.Time.UTC().Format(time.RFC3339)
 			}
-			d.Items = "TBE"
+			d.Items = fmt.Sprintf("%d items", items)
 			devices = append(devices, d)
 		}
 	}
