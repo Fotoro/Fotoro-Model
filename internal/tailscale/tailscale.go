@@ -286,7 +286,7 @@ func (m *Manager) SetupFunnel(localPort int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "sudo", "tailscale", "funnel", "--bg", fmt.Sprintf("%d", localPort))
+	cmd := exec.CommandContext(ctx, "tailscale", "funnel", "--bg", fmt.Sprintf("%d", localPort))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -315,7 +315,7 @@ func (m *Manager) SetupServe(localPort int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "sudo", "tailscale", "serve", "--bg", fmt.Sprintf("%d", localPort))
+	cmd := exec.CommandContext(ctx, "tailscale", "serve", "--bg", fmt.Sprintf("%d", localPort))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -359,6 +359,32 @@ func (m *Manager) ServeConfigured() bool {
 		}
 	}
 	return len(status) > 0
+}
+
+// ServesPort checks that the existing root route belongs to this Fotoro API.
+// It avoids reconfiguring Tailscale on every socket wake.
+func (m *Manager) ServesPort(port int) bool {
+	out, err := exec.Command("tailscale", "serve", "status", "--json").Output()
+	if err != nil {
+		return false
+	}
+	var status struct {
+		Web map[string]struct {
+			Handlers map[string]struct {
+				Proxy string `json:"Proxy"`
+			} `json:"Handlers"`
+		} `json:"Web"`
+	}
+	if json.Unmarshal(out, &status) != nil {
+		return false
+	}
+	want := fmt.Sprintf("http://127.0.0.1:%d", port)
+	for _, web := range status.Web {
+		if web.Handlers["/"].Proxy == want {
+			return true
+		}
+	}
+	return false
 }
 
 // FunnelConfigured reports whether tailscale serve status shows a public Funnel route.

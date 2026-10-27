@@ -59,25 +59,38 @@ func ensureTailscaleExpose(s *Server, addr string) {
 	tailnetURL := ""
 	serveEnabled := false
 	funnelEnabled := false
-	if err := ts.SetupServe(port); err != nil {
-		fmt.Printf("[WARN] tailscale serve failed: %v\n", err)
-		fmt.Printf("[HINT] Run manually: sudo tailscale serve --bg %d\n", port)
-	} else if url, err := ts.GetTailnetURL(); err == nil {
+	if ts.ServesPort(port) {
 		serveEnabled = true
-		tailnetURL = tailscale.NormalizeServerURL(url)
-		fmt.Printf("[TAILSCALE] Tailnet URL: %s\n", url)
+		fmt.Println("[TAILSCALE] Reusing existing Fotoro Serve route")
+	} else if err := ts.SetupServe(port); err != nil {
+		fmt.Printf("[WARN] tailscale serve failed: %v\n", err)
+		fmt.Printf("[HINT] Grant this user Tailscale operator access, then run: tailscale serve --bg %d\n", port)
+	} else {
+		serveEnabled = true
+	}
+	if serveEnabled {
+		url, err := ts.GetTailnetURL()
+		if err == nil {
+			tailnetURL = tailscale.NormalizeServerURL(url)
+			fmt.Printf("[TAILSCALE] Tailnet URL: %s\n", url)
+		}
 	}
 
-	if os.Getenv("FOTORO_FUNNEL") == "1" {
+	if ts.ServesPort(port) && ts.FunnelConfigured() {
+		funnelEnabled = true
+	} else if os.Getenv("FOTORO_FUNNEL") == "1" {
 		fmt.Printf("[TAILSCALE] Enabling public Funnel on port %d…\n", port)
 		if err := ts.SetupFunnel(port); err != nil {
 			fmt.Printf("[WARN] tailscale funnel failed: %v\n", err)
-			fmt.Printf("[HINT] Enable Funnel in Tailscale admin ACL, then: sudo tailscale funnel --bg %d\n", port)
+			fmt.Printf("[HINT] Enable Funnel in Tailscale admin ACL and grant operator access, then: tailscale funnel --bg %d\n", port)
 		} else if url, err := ts.GetPublicURL(); err == nil {
 			funnelEnabled = true
 			publicURL = url
 			fmt.Printf("[TAILSCALE] Public URL: %s\n", url)
 		}
+	}
+	if funnelEnabled && publicURL == "" {
+		publicURL, _ = ts.GetPublicURL()
 	}
 
 	if s.db != nil && (publicURL != "" || tailnetURL != "" || serveEnabled || funnelEnabled) {

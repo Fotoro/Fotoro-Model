@@ -83,14 +83,18 @@ func (s *Server) startBackupWorker() {
 				if err != nil || !status.Available {
 					continue
 				}
+				s.backgroundActive.Add(1)
 				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 				_, _ = s.media.VerifyPrimaryPending(ctx, 10)
 				_, _ = s.media.BackupPending(ctx, 10)
 				cancel()
+				s.backgroundActive.Add(-1)
 			case <-verifyTicker.C:
+				s.backgroundActive.Add(1)
 				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 				_, _ = s.media.VerifyBackupCopies(ctx, 100)
 				cancel()
+				s.backgroundActive.Add(-1)
 			}
 		}
 	}()

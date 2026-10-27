@@ -64,6 +64,7 @@ images-test/
 *.db
 *.db-shm
 *.db-wal
+*.db.pre-v1.snapshot
 *.sqlite
 *.sqlite3
 

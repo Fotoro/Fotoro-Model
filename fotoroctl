@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+service_unit="$unit_dir/fotoro.service"
+socket_unit="$unit_dir/fotoro.socket"
+address="${FOTORO_ADDR:-127.0.0.1:8765}"
+idle_minutes="${FOTORO_IDLE_MINUTES:-10}"
+
+usage() {
+  printf 'Usage: ./fotoroctl {start|stop|status}\n'
+  exit 2
+}
+
+case "${1:-}" in
+  start)
+    if [[ ! -x "$repo_dir/fotoro" ]]; then
+      printf 'Build the server first: cd %s && go build -o fotoro .\n' "$repo_dir" >&2
+      exit 1
+    fi
+    if [[ "$address" != 127.0.0.1:* ]]; then
+      printf 'Socket mode requires FOTORO_ADDR=127.0.0.1:<port>.\n' >&2
+      exit 1
+    fi
+    if [[ ! "$idle_minutes" =~ ^[1-9][0-9]*$ ]]; then
+      printf 'FOTORO_IDLE_MINUTES must be a positive whole number.\n' >&2
+      exit 1
+    fi
+    mkdir -p "$unit_dir"
+    printf '[Unit]\nDescription=Fotoro on-demand API socket\n\n[Socket]\nListenStream=%s\nNoDelay=true\n\n[Install]\nWantedBy=sockets.target\n' "$address" > "$socket_unit"
+    printf '[Unit]\nDescription=Fotoro on-demand API\nRequires=fotoro.socket\nAfter=fotoro.socket\n\n[Service]\nType=simple\nWorkingDirectory=%s\nExecStart=%s/fotoro server\nEnvironment=FOTORO_ADDR=%s\nEnvironment=FOTORO_IDLE_MINUTES=%s\nRestart=on-failure\nRestartSec=2\n' "$repo_dir" "$repo_dir" "$address" "$idle_minutes" > "$service_unit"
+    systemctl --user daemon-reload
+    systemctl --user start fotoro.socket
+    # The first local request configures Tailscale Serve/Funnel; later requests
+    # wake the API automatically through the socket.
+    curl --fail --silent --show-error --max-time 45 "http://$address/api/health" >/dev/null
+    printf 'Fotoro is on. The API sleeps after %s idle minutes.\n' "$idle_minutes"
+    printf 'Stop with: ./fotoroctl stop\n'
+    ;;
+  stop)
+    systemctl --user stop fotoro.service fotoro.socket
+    printf 'Fotoro is off. No boot startup was enabled.\n'
+    ;;
+  status)
+    systemctl --user status fotoro.socket fotoro.service --no-pager
+    ;;
+  *) usage ;;
+esac

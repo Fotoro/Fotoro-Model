@@ -47,10 +47,7 @@ func RunSetup(dbPath, model string) {
 		os.Exit(1)
 	}
 
-	if len(result.Token) > 24 {
-		fmt.Printf("\nLocal account linked (ID: %d)\n", result.LocalUserID)
-		fmt.Printf("Token received: %s…%s\n\n", result.Token[:12], result.Token[len(result.Token)-8:])
-	}
+	fmt.Printf("\nLocal account linked (ID: %d)\n\n", result.LocalUserID)
 
 	// Step 4: Directories
 	fmt.Println("══════════════════════════════════════════════════════════════════")
@@ -84,11 +81,12 @@ func RunSetup(dbPath, model string) {
 	fmt.Printf("  Uploads folder: %s\n", uploadsDir)
 	fmt.Println()
 	fmt.Println("Next steps:")
-	fmt.Println("  ./fotoro app       # Start the GUI")
-	fmt.Println("  ./fotoro server    # Start API server only")
+	fmt.Println("  ./fotoroctl start  # Turn on the on-demand API")
+	fmt.Println("  ./fotoroctl stop   # Turn it off")
+	fmt.Println("  ./fotoro app       # Start the optional desktop UI")
 	fmt.Println("  ./fotoro nodesync  # Re-push node info to dashboard")
 	fmt.Println()
-	fmt.Println("To stop: Press Ctrl+C or close the window")
-	fmt.Println("No background processes will remain running")
+	fmt.Println("The user socket starts manually and is not enabled at boot.")
+	fmt.Println("The API exits after ten idle minutes; the socket wakes it on request.")
 	fmt.Println()
 }

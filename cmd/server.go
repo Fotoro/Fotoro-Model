@@ -12,11 +12,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
@@ -42,6 +44,7 @@ type Server struct {
 	supabaseAuth     *auth.SupabaseAuth
 	tailscale        *tailscale.Manager
 	model            string
+	backgroundActive atomic.Int32
 	metricsMu        sync.Mutex
 	serverMu         sync.RWMutex
 	running          bool
@@ -185,12 +188,44 @@ func RunServer(addr, dbPath, model string) {
 	registerStorageRoutes(mux, s)
 	registerDiagnosticsRoutes(mux, s)
 
-	fmt.Printf("[SERVER] Running on %s\\n", addr)
+	listener, socketActivated, err := serverListener(addr)
+	if err != nil {
+		panic(err)
+	}
+	defer listener.Close()
+	fmt.Printf("[SERVER] Running on %s (socket activation: %t)\n", addr, socketActivated)
 	queue.StartDaemon(model)
 	s.startDerivativeWorker()
 	s.startBackupWorker()
 	go ensureTailscaleExpose(s, addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	var lastActivity atomic.Int64
+	var activeRequests atomic.Int32
+	lastActivity.Store(time.Now().UnixNano())
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/health" {
+			activeRequests.Add(1)
+			defer func() {
+				lastActivity.Store(time.Now().UnixNano())
+				activeRequests.Add(-1)
+			}()
+		}
+		mux.ServeHTTP(w, r)
+	})}
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(stop)
+	go func() {
+		select {
+		case <-stop:
+			fmt.Println("[SERVER] Stopping")
+		case <-idleShutdown(socketActivated, &lastActivity, &activeRequests, queue, s):
+			fmt.Println("[SERVER] Idle; returning to socket standby")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+	}()
+	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 		panic(err)
 	}
 }

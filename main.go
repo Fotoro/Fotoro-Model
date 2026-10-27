@@ -68,7 +68,7 @@ Usage: fotoro [command]
 
 Commands:
   app          Launch desktop GUI (backend + Qt6 interface)
-  server       Start HTTP API server only
+  server       Run HTTP API in foreground (advanced)
   ingest       Batch process images from directory
   backfill     Generate embeddings for existing images
   backfill-thumbs  Generate missing thumbnails
@@ -91,7 +91,8 @@ Environment:
 
 Examples:
   fotoro app                 # Start GUI
-  fotoro server              # Start API server
+  ./fotoroctl start           # Turn on on-demand API
+  ./fotoroctl stop            # Turn off API and socket
   fotoro ingest ./photos     # Process photos directory
   fotoro scheduler           # Run pending queue now`)
 }

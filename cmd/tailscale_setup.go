@@ -107,8 +107,8 @@ func finalizeTailscale(ts *tailscale.Manager, nodeName string, opts tailscaleFin
 	// Serve/funnel need the API listening on localhost — configured when you run server/app.
 	fmt.Println()
 	fmt.Println("Tailscale VPN is ready.")
-	fmt.Println("Start the API to enable tailnet access:")
-	fmt.Println("  ./fotoro server   or   ./fotoro app")
+	fmt.Println("Start the on-demand API to enable tailnet access:")
+	fmt.Println("  ./fotoroctl start")
 	if os.Getenv("FOTORO_FUNNEL") == "1" {
 		fmt.Println("(Funnel will be enabled automatically when the server starts)")
 	}
