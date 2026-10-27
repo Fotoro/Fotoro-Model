@@ -85,3 +85,30 @@ func TestVersionOneAddsDashboardMetricsWithoutChangingMedia(t *testing.T) {
 		t.Fatalf("metrics table missing: %v", err)
 	}
 }
+
+func TestVersionTwoAddsMediaSigningKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fotoro.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE server_config (id INTEGER PRIMARY KEY);
+		INSERT INTO server_config (id) VALUES (1);
+		PRAGMA user_version = 2`); err != nil {
+		t.Fatal(err)
+	}
+	legacy.Close()
+	database, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var version int
+	var key sql.NullString
+	if err := database.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != currentSchemaVersion {
+		t.Fatalf("version = %d, error = %v", version, err)
+	}
+	if err := database.QueryRow(`SELECT media_signing_key FROM server_config WHERE id = 1`).Scan(&key); err != nil {
+		t.Fatalf("media signing key column missing: %v", err)
+	}
+}

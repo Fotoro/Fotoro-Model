@@ -4,9 +4,10 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 )
 
-const currentSchemaVersion = 2
+const currentSchemaVersion = 3
 
 func (d *DB) migrateVersioned(path string, existing bool) error {
 	var version int
@@ -19,8 +20,17 @@ func (d *DB) migrateVersioned(path string, existing bool) error {
 	if version == currentSchemaVersion {
 		return nil
 	}
+	if version == 2 {
+		if err := d.migrateMediaLinkKey(); err != nil {
+			return err
+		}
+		return d.recordSchemaVersion()
+	}
 	if version == 1 {
 		if err := d.migrateDashboardMetrics(); err != nil {
+			return err
+		}
+		if err := d.migrateMediaLinkKey(); err != nil {
 			return err
 		}
 		return d.recordSchemaVersion()
@@ -52,6 +62,16 @@ func (d *DB) migrateVersioned(path string, existing bool) error {
 		return fmt.Errorf("migration integrity check failed: %s: %v", integrity, err)
 	}
 	return d.recordSchemaVersion()
+}
+
+func (d *DB) migrateMediaLinkKey() error {
+	if _, err := d.Exec(`ALTER TABLE server_config ADD COLUMN media_signing_key TEXT`); err != nil {
+		if strings.Contains(err.Error(), "duplicate column name") {
+			return nil
+		}
+		return fmt.Errorf("add media signing key: %w", err)
+	}
+	return nil
 }
 
 func (d *DB) recordSchemaVersion() error {
