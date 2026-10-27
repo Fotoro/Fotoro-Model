@@ -3,6 +3,7 @@ package validate
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"image"
 	"io"
@@ -19,6 +20,7 @@ const (
 	VLMSize     = 336
 	ThumbSmall  = 256
 	ThumbMedium = 1024
+	ThumbLarge  = 2048
 	MaxFileSize = 50 * 1024 * 1024
 )
 
@@ -28,6 +30,7 @@ type ImageMeta struct {
 	VLMBytes    []byte
 	ThumbSmall  []byte
 	ThumbMedium []byte
+	ThumbLarge  []byte
 	Width       int
 	Height      int
 	TakenAt     time.Time
@@ -141,6 +144,10 @@ func PrepareImage(path string) (*ImageMeta, error) {
 	if err := imaging.Encode(&medBuf, medImg, imaging.JPEG, imaging.JPEGQuality(80)); err != nil {
 		return nil, err
 	}
+	large, err := encodeLargeThumbnail(img)
+	if err != nil {
+		return nil, err
+	}
 
 	return &ImageMeta{
 		Path:        path,
@@ -148,6 +155,7 @@ func PrepareImage(path string) (*ImageMeta, error) {
 		VLMBytes:    vlmBuf.Bytes(),
 		ThumbSmall:  smallBuf.Bytes(),
 		ThumbMedium: medBuf.Bytes(),
+		ThumbLarge:  large,
 		Width:       w,
 		Height:      h,
 		TakenAt:     takenAt,
@@ -162,7 +170,11 @@ func SaveThumbnails(baseDir string, meta *ImageMeta) error {
 	}{
 		{"small", meta.ThumbSmall},
 		{"medium", meta.ThumbMedium},
+		{"large", meta.ThumbLarge},
 	} {
+		if len(size.data) == 0 {
+			continue
+		}
 		dir := filepath.Join(baseDir, "thumbnails", size.name, meta.Hash[:2])
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return err
@@ -172,4 +184,59 @@ func SaveThumbnails(baseDir string, meta *ImageMeta) error {
 		}
 	}
 	return nil
+}
+
+func encodeLargeThumbnail(img image.Image) ([]byte, error) {
+	w, h := img.Bounds().Dx(), img.Bounds().Dy()
+	if w > ThumbLarge || h > ThumbLarge {
+		img = imaging.Fit(img, ThumbLarge, ThumbLarge, imaging.Lanczos)
+	}
+	var output bytes.Buffer
+	if err := imaging.Encode(&output, img, imaging.JPEG, imaging.JPEGQuality(82)); err != nil {
+		return nil, err
+	}
+	return output.Bytes(), nil
+}
+
+// SaveLargeThumbnail builds a disposable display tier from an existing original.
+// It never modifies the source and atomically publishes the completed JPEG.
+func SaveLargeThumbnail(baseDir, hash, sourcePath string) (string, int64, error) {
+	if len(hash) != 64 {
+		return "", 0, fmt.Errorf("invalid media hash")
+	}
+	if _, err := hex.DecodeString(hash); err != nil {
+		return "", 0, fmt.Errorf("invalid media hash")
+	}
+	dir := filepath.Join(baseDir, "thumbnails", "large", hash[:2])
+	path := filepath.Join(dir, hash+".jpg")
+	if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+		return path, info.Size(), nil
+	}
+	img, err := imaging.Open(sourcePath)
+	if err != nil {
+		return "", 0, err
+	}
+	encoded, err := encodeLargeThumbnail(img)
+	if err != nil {
+		return "", 0, err
+	}
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return "", 0, err
+	}
+	temp, err := os.CreateTemp(dir, ".large-*.jpg")
+	if err != nil {
+		return "", 0, err
+	}
+	defer os.Remove(temp.Name())
+	if _, err := temp.Write(encoded); err != nil {
+		temp.Close()
+		return "", 0, err
+	}
+	if err := temp.Close(); err != nil {
+		return "", 0, err
+	}
+	if err := os.Rename(temp.Name(), path); err != nil {
+		return "", 0, err
+	}
+	return path, int64(len(encoded)), nil
 }

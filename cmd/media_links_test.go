@@ -50,10 +50,25 @@ func TestSignedMediaLinksAreScopedAndSurviveKeyReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &Server{db: database, media: service, mediaSigningKey: key}
-	assets := []media.Asset{{ID: id, PreviewStatus: "ready"}}
+	largePath, err := service.ThumbnailPath(id, "large")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(largePath), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(largePath, []byte("LARGE"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	assets := []media.Asset{{ID: id, PreviewStatus: "ready", DetailURL: "/api/v1/media/" + id + "/thumbnail?size=large"}}
 	s.attachDirectMediaLinks(assets)
-	if assets[0].DirectContentURL == "" || assets[0].DirectThumbnailURL == "" || assets[0].DirectPreviewURL == "" {
+	if assets[0].DirectContentURL == "" || assets[0].DirectThumbnailURL == "" || assets[0].DirectPreviewURL == "" || assets[0].DirectDetailURL == "" {
 		t.Fatalf("direct media URLs missing: %+v", assets[0])
+	}
+	detail := httptest.NewRecorder()
+	s.handleSignedMedia(detail, httptest.NewRequest(http.MethodGet, assets[0].DirectDetailURL, nil))
+	if detail.Code != http.StatusOK || detail.Body.String() != "LARGE" {
+		t.Fatalf("signed detail response: %d %q", detail.Code, detail.Body.String())
 	}
 	request := httptest.NewRequest(http.MethodGet, assets[0].DirectContentURL, nil)
 	request.Header.Set("Range", "bytes=0-3")

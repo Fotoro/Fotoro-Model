@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 
 	"fotoro/cmd"
 )
@@ -36,6 +37,20 @@ func main() {
 		cmd.RunBackfillThumbs(dbPath)
 	case "reconcile-sizes":
 		cmd.RunReconcileSizes(dbPath)
+	case "backfill-detail":
+		limit := 25
+		if len(os.Args) > 2 {
+			var err error
+			limit, err = strconv.Atoi(os.Args[2])
+			if err != nil || limit < 1 || limit > 1000 {
+				fmt.Fprintln(os.Stderr, "Usage: fotoro backfill-detail [1-1000 images]")
+				os.Exit(1)
+			}
+		}
+		if err := cmd.RunBackfillDetail(dbPath, limit); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	case "system":
 		cmd.RunSystemCheck()
 	case "setup":
@@ -75,6 +90,7 @@ Commands:
   backfill     Generate embeddings for existing images
   backfill-thumbs  Generate missing thumbnails
   reconcile-sizes  Measure legacy media sizes for accurate storage totals
+  backfill-detail [count]  Build 2048 px viewing copies of older images (default: 25)
   scheduler    Run scheduled processing (manual)
   setup        Interactive first-time setup wizard
   login        Sign in via fotoro.vercel.app (links account to this install)

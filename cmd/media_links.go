@@ -93,7 +93,9 @@ func (s *Server) attachDirectMediaLinks(assets []media.Asset) {
 	if base == "" {
 		return
 	}
-	expires := time.Now().Truncate(15 * time.Minute).Add(mediaLinkLifetime).Unix()
+	// Keep a stable URL for an hour so a refreshed timeline can reuse the
+	// browser's private cache instead of downloading the same thumbnail again.
+	expires := time.Now().Truncate(time.Hour).Add(mediaLinkLifetime).Unix()
 	for i := range assets {
 		a := &assets[i]
 		if !validMediaID(a.ID) {
@@ -103,6 +105,9 @@ func (s *Server) attachDirectMediaLinks(assets []media.Asset) {
 		if a.PreviewStatus == "ready" {
 			a.DirectThumbnailURL = s.signedMediaURL(base, a.ID, "small", expires)
 			a.DirectPreviewURL = s.signedMediaURL(base, a.ID, "medium", expires)
+			if a.DetailURL != "" {
+				a.DirectDetailURL = s.signedMediaURL(base, a.ID, "large", expires)
+			}
 		}
 	}
 }
@@ -118,7 +123,7 @@ func (s *Server) handleSignedMedia(w http.ResponseWriter, r *http.Request) {
 	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/media-file/"), "/")
 	if len(parts) != 2 || !validMediaID(parts[0]) ||
-		(parts[1] != "small" && parts[1] != "medium" && parts[1] != "original") {
+		(parts[1] != "small" && parts[1] != "medium" && parts[1] != "large" && parts[1] != "original") {
 		http.NotFound(w, r)
 		return
 	}

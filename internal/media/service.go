@@ -68,8 +68,10 @@ type Asset struct {
 	DeviceAssetID      string     `json:"device_asset_id,omitempty"`
 	ContentURL         string     `json:"content_url"`
 	ThumbnailURL       string     `json:"thumbnail_url,omitempty"`
+	DetailURL          string     `json:"detail_url,omitempty"`
 	DirectThumbnailURL string     `json:"direct_thumbnail_url,omitempty"`
 	DirectPreviewURL   string     `json:"direct_preview_url,omitempty"`
+	DirectDetailURL    string     `json:"direct_detail_url,omitempty"`
 	DirectContentURL   string     `json:"direct_content_url,omitempty"`
 	SafeToDelete       bool       `json:"safe_to_delete"`
 	StorageCopies      int        `json:"verified_storage_copies"`
@@ -189,6 +191,7 @@ func NewService(database *db.DB, dbPath string) (*Service, error) {
 		filepath.Join(storageRoot, ".partial"),
 		filepath.Join(s.cacheDir, "thumbnails", "small"),
 		filepath.Join(s.cacheDir, "thumbnails", "medium"),
+		filepath.Join(s.cacheDir, "thumbnails", "large"),
 	} {
 		if err := os.MkdirAll(dir, 0750); err != nil {
 			return nil, err
@@ -343,6 +346,10 @@ func (s *Service) generateImageDerivatives(id, path, mimeType, name string, now 
 		syncLegacyImage(s.db, id, path, mimeType, name, nil, now)
 		return err
 	}
+	if meta.Hash != id {
+		_, _ = s.db.Exec(`UPDATE media_assets SET preview_status = 'failed', updated_at = ? WHERE id = ?`, now, id)
+		return fmt.Errorf("original checksum changed before derivative generation")
+	}
 	if err := validate.SaveThumbnails(s.cacheDir, meta); err != nil {
 		_, _ = s.db.Exec(`UPDATE media_assets SET preview_status = 'failed', updated_at = ? WHERE id = ?`, now, id)
 		syncLegacyImage(s.db, id, path, mimeType, name, meta, now)
@@ -356,7 +363,7 @@ func (s *Service) generateImageDerivatives(id, path, mimeType, name string, now 
 		UPDATE media_assets SET width = ?, height = ?, captured_at = ?,
 			preview_status = 'ready', updated_at = ? WHERE id = ?
 	`, meta.Width, meta.Height, captured, now, id)
-	for _, size := range []string{"small", "medium"} {
+	for _, size := range []string{"small", "medium", "large"} {
 		thumbPath := filepath.Join(s.cacheDir, "thumbnails", size, id[:2], id+".jpg")
 		thumbInfo, err := os.Stat(thumbPath)
 		if err != nil {
@@ -531,6 +538,11 @@ func (s *Service) decorateAsset(a *Asset) {
 	a.ContentURL = "/api/v1/media/" + a.ID + "/content"
 	if a.PreviewStatus == "ready" {
 		a.ThumbnailURL = "/api/v1/media/" + a.ID + "/thumbnail?size=small"
+		if path, err := s.ThumbnailPath(a.ID, "large"); err == nil {
+			if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
+				a.DetailURL = "/api/v1/media/" + a.ID + "/thumbnail?size=large"
+			}
+		}
 	}
 	var primaryPath, backupPath string
 	_ = s.db.QueryRow(`SELECT COALESCE(MAX(CASE WHEN storage_name = 'primary' THEN storage_path END), ''),
@@ -567,6 +579,11 @@ func (s *Service) decorateAssetPage(assets []Asset) error {
 		a.ContentURL = "/api/v1/media/" + a.ID + "/content"
 		if a.PreviewStatus == "ready" {
 			a.ThumbnailURL = "/api/v1/media/" + a.ID + "/thumbnail?size=small"
+			if path, err := s.ThumbnailPath(a.ID, "large"); err == nil {
+				if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
+					a.DetailURL = "/api/v1/media/" + a.ID + "/thumbnail?size=large"
+				}
+			}
 		}
 		paths[a.ID] = &copyPaths{}
 		placeholders = append(placeholders, "?")
@@ -634,7 +651,7 @@ func (s *Service) ThumbnailPath(id, size string) (string, error) {
 	if !isSHA256(id) {
 		return "", ErrNotFound
 	}
-	if size != "medium" {
+	if size != "medium" && size != "large" {
 		size = "small"
 	}
 	// The content hash determines the thumbnail path. ServeFile handles
