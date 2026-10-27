@@ -57,7 +57,7 @@ func TestDashboardMetricsPersistAndRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Total != 1 || first.Processed != 1 || first.ThumbnailsMedium != 1 || first.StorageUsedBytes != 12 || first.PhotosWithFaces != 1 || first.DevicesCount != 2 || first.QueuePending != 1 || first.ConfiguredModel != "test-model" || first.CollectedAt == "" {
+	if first.Total != 1 || first.Processed != 1 || first.ThumbnailsMedium != 1 || first.MediaBytes != 5 || first.CacheBytes != 7 || first.StagingBytes != 0 || first.StorageUsedBytes != 12 || first.PhotosWithFaces != 1 || first.DevicesCount != 2 || first.QueuePending != 1 || first.ConfiguredModel != "test-model" || first.CollectedAt == "" {
 		t.Fatalf("unexpected first snapshot: %+v", first)
 	}
 	var stored string

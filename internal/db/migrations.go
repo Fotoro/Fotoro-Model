@@ -74,6 +74,7 @@ func (d *DB) ExtendedMigrate() error {
 		`ALTER TABLE server_config ADD COLUMN schedule_time TEXT DEFAULT '02:00'`,
 		`ALTER TABLE server_config ADD COLUMN schedule_days TEXT DEFAULT '1,2,3,4,5'`,
 		`ALTER TABLE server_config ADD COLUMN tailnet_serve_url TEXT`,
+		`ALTER TABLE server_config ADD COLUMN media_signing_key TEXT`,
 		`CREATE TABLE IF NOT EXISTS offline_cache (
 			id INTEGER PRIMARY KEY,
 			hash TEXT NOT NULL,

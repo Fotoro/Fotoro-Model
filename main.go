@@ -34,6 +34,8 @@ func main() {
 		cmd.RunBackfill(dbPath, model)
 	case "backfill-thumbs":
 		cmd.RunBackfillThumbs(dbPath)
+	case "reconcile-sizes":
+		cmd.RunReconcileSizes(dbPath)
 	case "system":
 		cmd.RunSystemCheck()
 	case "setup":
@@ -72,6 +74,7 @@ Commands:
   ingest       Batch process images from directory
   backfill     Generate embeddings for existing images
   backfill-thumbs  Generate missing thumbnails
+  reconcile-sizes  Measure legacy media sizes for accurate storage totals
   scheduler    Run scheduled processing (manual)
   setup        Interactive first-time setup wizard
   login        Sign in via fotoro.vercel.app (links account to this install)

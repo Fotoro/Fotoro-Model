@@ -58,6 +58,7 @@ func (s *Server) handleMediaList(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"could not list media"}`, http.StatusInternalServerError)
 		return
 	}
+	s.attachDirectMediaLinks(assets)
 	if page < 1 {
 		page = 1
 	}

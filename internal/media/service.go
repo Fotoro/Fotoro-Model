@@ -50,26 +50,29 @@ type Service struct {
 }
 
 type Asset struct {
-	ID               string     `json:"id"`
-	Hash             string     `json:"sha256"`
-	OriginalName     string     `json:"original_name"`
-	MediaKind        string     `json:"media_kind"`
-	MIMEType         string     `json:"mime_type"`
-	FileSize         int64      `json:"file_size"`
-	Status           string     `json:"status"`
-	CapturedAt       *time.Time `json:"captured_at,omitempty"`
-	ImportedAt       time.Time  `json:"imported_at"`
-	Width            *int       `json:"width,omitempty"`
-	Height           *int       `json:"height,omitempty"`
-	DurationMS       *int64     `json:"duration_ms,omitempty"`
-	ChecksumVerified bool       `json:"checksum_verified"`
-	PreviewStatus    string     `json:"preview_status"`
-	SourceDeviceID   string     `json:"source_device_id,omitempty"`
-	DeviceAssetID    string     `json:"device_asset_id,omitempty"`
-	ContentURL       string     `json:"content_url"`
-	ThumbnailURL     string     `json:"thumbnail_url,omitempty"`
-	SafeToDelete     bool       `json:"safe_to_delete"`
-	StorageCopies    int        `json:"verified_storage_copies"`
+	ID                 string     `json:"id"`
+	Hash               string     `json:"sha256"`
+	OriginalName       string     `json:"original_name"`
+	MediaKind          string     `json:"media_kind"`
+	MIMEType           string     `json:"mime_type"`
+	FileSize           int64      `json:"file_size"`
+	Status             string     `json:"status"`
+	CapturedAt         *time.Time `json:"captured_at,omitempty"`
+	ImportedAt         time.Time  `json:"imported_at"`
+	Width              *int       `json:"width,omitempty"`
+	Height             *int       `json:"height,omitempty"`
+	DurationMS         *int64     `json:"duration_ms,omitempty"`
+	ChecksumVerified   bool       `json:"checksum_verified"`
+	PreviewStatus      string     `json:"preview_status"`
+	SourceDeviceID     string     `json:"source_device_id,omitempty"`
+	DeviceAssetID      string     `json:"device_asset_id,omitempty"`
+	ContentURL         string     `json:"content_url"`
+	ThumbnailURL       string     `json:"thumbnail_url,omitempty"`
+	DirectThumbnailURL string     `json:"direct_thumbnail_url,omitempty"`
+	DirectPreviewURL   string     `json:"direct_preview_url,omitempty"`
+	DirectContentURL   string     `json:"direct_content_url,omitempty"`
+	SafeToDelete       bool       `json:"safe_to_delete"`
+	StorageCopies      int        `json:"verified_storage_copies"`
 }
 
 type ImportOptions struct {

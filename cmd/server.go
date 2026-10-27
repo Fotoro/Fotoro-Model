@@ -44,6 +44,7 @@ type Server struct {
 	supabaseAuth     *auth.SupabaseAuth
 	tailscale        *tailscale.Manager
 	model            string
+	mediaSigningKey  []byte
 	backgroundActive atomic.Int32
 	metricsMu        sync.Mutex
 	serverMu         sync.RWMutex
@@ -83,6 +84,10 @@ func RunServer(addr, dbPath, model string) {
 	if err != nil {
 		panic(fmt.Errorf("media service: %w", err))
 	}
+	mediaSigningKey, err := loadMediaSigningKey(database)
+	if err != nil {
+		panic(fmt.Errorf("media signing key: %w", err))
+	}
 
 	supabaseURL := os.Getenv("SUPABASE_URL")
 	supabaseAnon := os.Getenv("SUPABASE_ANON_KEY")
@@ -115,20 +120,27 @@ func RunServer(addr, dbPath, model string) {
 	}()
 
 	s := &Server{
-		db:           database,
-		cacheDir:     filepath.Join(filepath.Dir(dbPath), ".cache"),
-		ollama:       ollama.NewClient("", model),
-		embed:        ollama.NewEmbedClient(),
-		index:        idx,
-		queue:        queue,
-		media:        mediaService,
-		supabaseAuth: supabaseAuth,
-		tailscale:    tailscale.NewManager(),
-		model:        model,
+		db:              database,
+		cacheDir:        filepath.Join(filepath.Dir(dbPath), ".cache"),
+		ollama:          ollama.NewClient("", model),
+		embed:           ollama.NewEmbedClient(),
+		index:           idx,
+		queue:           queue,
+		media:           mediaService,
+		mediaSigningKey: mediaSigningKey,
+		supabaseAuth:    supabaseAuth,
+		tailscale:       tailscale.NewManager(),
+		model:           model,
 	}
 	s.loadStoredSession()
 	go func() {
-		// Keep the local SQLite snapshot fresh even when no dashboard is open.
+		if updated, err := s.media.ReconcileMediaSizes(context.Background(), 100000); err != nil {
+			fmt.Printf("[WARN] Media size reconciliation failed: %v\n", err)
+		} else if updated > 0 {
+			fmt.Printf("[INIT] Measured %d legacy media sizes\n", updated)
+			_, _ = s.db.Exec(`DELETE FROM dashboard_metrics WHERE id = 1`)
+		}
+		// Keep the local SQLite snapshot fresh while the API is awake.
 		_, _ = s.dashboardMetrics(context.Background())
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
@@ -151,6 +163,7 @@ func RunServer(addr, dbPath, model string) {
 	// Public health probe. Setup and local-session endpoints are deliberately
 	// loopback-only; they must never be reachable through a reverse proxy.
 	mux.HandleFunc("/api/health", s.handleHealth)
+	mux.HandleFunc("/api/v1/media-file/", s.handleSignedMedia)
 	mux.HandleFunc("/api/auth/status", s.localOnly(s.handleAuthStatus))
 	mux.HandleFunc("/api/auth/session", s.localOnly(s.handleAuthSession))
 	mux.HandleFunc("/api/auth/login-url", s.localOnly(s.handleAuthLoginURL))

@@ -22,6 +22,9 @@ type DashboardMetrics struct {
 	Failed           int    `json:"failed"`
 	ThumbnailsMedium int    `json:"thumbnails_medium"`
 	StorageUsedBytes int64  `json:"storage_used_bytes"`
+	MediaBytes       int64  `json:"media_bytes"`
+	CacheBytes       int64  `json:"cache_bytes"`
+	StagingBytes     int64  `json:"staging_bytes"`
 	DiskTotalBytes   uint64 `json:"disk_total_bytes"`
 	DiskFreeBytes    uint64 `json:"disk_free_bytes"`
 	DevicesCount     int    `json:"devices_count"`
@@ -136,6 +139,9 @@ func (s *Server) collectDashboardMetrics(ctx context.Context) (DashboardMetrics,
 	}
 	// Original sizes are written to the catalogue at ingestion. Walking every
 	// original on each refresh would compete with thumbnail and video reads.
+	m.MediaBytes = cataloguedBytes
+	m.CacheBytes = cacheBytes
+	m.StagingBytes = stagingBytes
 	m.StorageUsedBytes = cataloguedBytes + cacheBytes + stagingBytes
 	m.ThumbnailsMedium = mediumCount
 	if disk, err := statsDiskUsage(storageRoot); err == nil {
