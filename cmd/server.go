@@ -214,6 +214,9 @@ func RunServer(addr, dbPath, model string) {
 	var lastActivity atomic.Int64
 	var activeRequests atomic.Int32
 	lastActivity.Store(time.Now().UnixNano())
+	// The signed-in website talks directly to this host over its Tailscale
+	// Funnel route. Authentication still happens inside each API handler.
+	webHandler := s.withCORS(mux.ServeHTTP)
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/health" {
 			activeRequests.Add(1)
@@ -222,7 +225,7 @@ func RunServer(addr, dbPath, model string) {
 				activeRequests.Add(-1)
 			}()
 		}
-		mux.ServeHTTP(w, r)
+		webHandler(w, r)
 	})}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)

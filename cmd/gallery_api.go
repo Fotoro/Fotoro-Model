@@ -54,8 +54,9 @@ func (s *Server) withCORS(next http.HandlerFunc) http.HandlerFunc {
 		}
 		if allowOrigin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, POST, PATCH, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Upload-Offset, Range, If-Range, If-None-Match, If-Modified-Since")
+			w.Header().Set("Access-Control-Expose-Headers", "Upload-Offset, Upload-Length, Location, Accept-Ranges, Content-Range, ETag, Last-Modified")
 			w.Header().Set("Access-Control-Max-Age", "86400")
 			w.Header().Set("Vary", "Origin")
 		}
