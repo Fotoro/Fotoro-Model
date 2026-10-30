@@ -24,8 +24,10 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	// WAL allows readers while a writer is active. A single connection lets one
+	// slow transaction block every authenticated API request, including pairing.
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
 
 	d := &DB{db}
 	if err := d.migrateVersioned(path, existing); err != nil {

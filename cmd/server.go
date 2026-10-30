@@ -250,7 +250,7 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Explicit opt-in for isolated local development only.
 		if s.isLocalRequest(r) && localAuthBypassEnabled() {
-			ownerID, _ := s.boundOwnerID()
+			ownerID, _ := s.boundOwnerID(r.Context())
 			if ownerID == "" {
 				ownerID = "local"
 			}

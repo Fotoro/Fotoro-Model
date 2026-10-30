@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -22,7 +23,7 @@ func (s *Server) authorizeUser(r *http.Request, user *auth.User) error {
 		if err != nil || ownerID == "" {
 			return fmt.Errorf("device is not linked to an owner")
 		}
-		if bound, err := s.boundOwnerID(); err != nil || bound != ownerID {
+		if bound, err := s.boundOwnerID(r.Context()); err != nil || bound != ownerID {
 			return fmt.Errorf("device owner mismatch")
 		}
 		need := "media:read"
@@ -41,16 +42,16 @@ func (s *Server) authorizeUser(r *http.Request, user *auth.User) error {
 		}
 		return nil
 	}
-	ownerID, err := s.boundOwnerID()
+	ownerID, err := s.boundOwnerID(r.Context())
 	if err != nil || ownerID == "" || ownerID != user.ID {
 		return fmt.Errorf("account is not linked to this server")
 	}
 	return nil
 }
 
-func (s *Server) boundOwnerID() (string, error) {
+func (s *Server) boundOwnerID(ctx context.Context) (string, error) {
 	var ownerID string
-	err := s.db.QueryRow(`SELECT COALESCE(auth_user_id, '') FROM server_config WHERE id = 1`).Scan(&ownerID)
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(auth_user_id, '') FROM server_config WHERE id = 1`).Scan(&ownerID)
 	return ownerID, err
 }
 
