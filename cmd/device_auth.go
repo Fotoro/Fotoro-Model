@@ -164,7 +164,11 @@ func (s *Server) handleRedeemPairingSession(w http.ResponseWriter, r *http.Reque
 		http.Error(w, `{"error":"database unavailable"}`, http.StatusInternalServerError)
 		return
 	}
-	ownerID, err := s.boundOwnerID()
+	// Read through the transaction. The database deliberately has one open
+	// connection; calling s.boundOwnerID here would wait for this transaction's
+	// connection forever and stall every subsequent authenticated request.
+	var ownerID string
+	err = tx.QueryRow(`SELECT COALESCE(auth_user_id, '') FROM server_config WHERE id = 1`).Scan(&ownerID)
 	if err != nil || ownerID == "" || createdBy != ownerID {
 		http.Error(w, `{"error":"pairing owner mismatch"}`, http.StatusForbidden)
 		return
