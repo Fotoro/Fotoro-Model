@@ -6,6 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
+
+	"fotoro/internal/media"
 
 	"fotoro/internal/auth"
 )
@@ -24,9 +27,10 @@ func (s *Server) handleDeviceAssetStatus(w http.ResponseWriter, r *http.Request)
 	}
 	var body struct {
 		Assets []struct {
-			DeviceAssetID string `json:"device_asset_id"`
-			Size          int64  `json:"size"`
-			SHA256        string `json:"sha256"`
+			DeviceAssetID string     `json:"device_asset_id"`
+			Size          int64      `json:"size"`
+			SHA256        string     `json:"sha256"`
+			CapturedAt    *time.Time `json:"captured_at,omitempty"`
 		} `json:"assets"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&body); err != nil || len(body.Assets) > 200 {
@@ -46,6 +50,10 @@ func (s *Server) handleDeviceAssetStatus(w http.ResponseWriter, r *http.Request)
 			http.Error(w, `{"error":"invalid device asset id"}`, http.StatusBadRequest)
 			return
 		}
+		if requestAsset.CapturedAt != nil && !media.ValidCapturedAt(*requestAsset.CapturedAt) {
+			http.Error(w, `{"error":"invalid captured_at"}`, http.StatusBadRequest)
+			return
+		}
 		result := item{DeviceAssetID: id, State: "needs_upload"}
 		var assetID, storedHash string
 		var storedSize int64
@@ -57,6 +65,16 @@ func (s *Server) handleDeviceAssetStatus(w http.ResponseWriter, r *http.Request)
 		}
 		if assetID != "" && requestAsset.Size == storedSize &&
 			(requestAsset.SHA256 == "" || strings.EqualFold(requestAsset.SHA256, storedHash)) {
+			if requestAsset.CapturedAt != nil {
+				_, err = s.db.Exec(`UPDATE media_assets SET captured_at = COALESCE(captured_at, ?)
+					WHERE id = ?`, requestAsset.CapturedAt.UTC(), assetID)
+				if err != nil {
+					http.Error(w, `{"error":"could not save capture date"}`, http.StatusInternalServerError)
+					return
+				}
+				_, _ = s.db.Exec(`UPDATE images SET taken_at = COALESCE(taken_at, ?)
+					WHERE hash = ?`, requestAsset.CapturedAt.UTC(), assetID)
+			}
 			asset, err := s.media.GetAsset(assetID)
 			if err == nil {
 				result.MediaAssetID = assetID

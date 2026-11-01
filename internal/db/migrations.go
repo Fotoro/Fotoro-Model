@@ -177,6 +177,7 @@ func (d *DB) ExtendedMigrate() error {
 			FOREIGN KEY (media_asset_id) REFERENCES media_assets(id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_upload_sessions_owner ON upload_sessions(owner_id, status)`,
+		`ALTER TABLE upload_sessions ADD COLUMN captured_at DATETIME`,
 		`CREATE INDEX IF NOT EXISTS idx_upload_sessions_expiry ON upload_sessions(expires_at)`,
 		`CREATE TABLE IF NOT EXISTS derivatives (
 			id INTEGER PRIMARY KEY,

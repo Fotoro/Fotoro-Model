@@ -59,7 +59,7 @@ func FastHash(path string) (string, error) {
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
-func extractDateTaken(path string) time.Time {
+func ExtractDateTaken(path string) time.Time {
 	f, err := os.Open(path)
 	if err != nil {
 		return time.Time{}
@@ -121,7 +121,7 @@ func PrepareImage(path string) (*ImageMeta, error) {
 	w = img.Bounds().Dx()
 	h = img.Bounds().Dy()
 
-	takenAt := extractDateTaken(path)
+	takenAt := ExtractDateTaken(path)
 	phash := computePHash(img)
 
 	vlmImg := img

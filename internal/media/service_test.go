@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"fotoro/internal/db"
 )
@@ -57,12 +58,13 @@ func TestBackupMountMustRemainIndependent(t *testing.T) {
 
 func TestResumableUploadAndBackup(t *testing.T) {
 	s := newTestService(t)
+	captured := time.Date(2021, 5, 4, 10, 30, 0, 0, time.UTC)
 	data := []byte("original media bytes for a resumable upload")
 	digest := sha256.Sum256(data)
 	hash := hex.EncodeToString(digest[:])
 	u, err := s.CreateUpload("owner-1", CreateUploadRequest{
 		OriginalName: "camera.jpg", MIMEType: "image/jpeg", ExpectedSize: int64(len(data)),
-		ExpectedSHA256: hash, DeviceID: "phone-1", DeviceAssetID: "asset-1",
+		ExpectedSHA256: hash, DeviceID: "phone-1", DeviceAssetID: "asset-1", CapturedAt: &captured,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +85,8 @@ func TestResumableUploadAndBackup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Asset.Hash != hash || result.Asset.SafeToDelete || result.Asset.StorageCopies != 1 {
+	if result.Asset.Hash != hash || result.Asset.SafeToDelete || result.Asset.StorageCopies != 1 ||
+		result.Asset.CapturedAt == nil || !result.Asset.CapturedAt.Equal(captured) {
 		t.Fatalf("unexpected primary state: %+v", result.Asset)
 	}
 	page, total, err := s.ListAssets(1, 100, "", "", "")

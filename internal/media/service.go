@@ -82,6 +82,7 @@ type ImportOptions struct {
 	MIMEType      string
 	DeviceID      string
 	DeviceAssetID string
+	CapturedAt    *time.Time
 	MoveSource    bool
 }
 
@@ -91,31 +92,38 @@ type ImportResult struct {
 }
 
 type UploadSession struct {
-	ID             string    `json:"id"`
-	OwnerID        string    `json:"-"`
-	DeviceID       string    `json:"device_id,omitempty"`
-	DeviceAssetID  string    `json:"device_asset_id,omitempty"`
-	OriginalName   string    `json:"original_name"`
-	MIMEType       string    `json:"mime_type"`
-	ExpectedSize   int64     `json:"expected_size"`
-	ExpectedSHA256 string    `json:"expected_sha256,omitempty"`
-	ReceivedSize   int64     `json:"received_size"`
-	TempPath       string    `json:"-"`
-	Status         string    `json:"status"`
-	MediaAssetID   string    `json:"media_asset_id,omitempty"`
-	ErrorMessage   string    `json:"error_message,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
-	ExpiresAt      time.Time `json:"expires_at"`
+	ID             string     `json:"id"`
+	OwnerID        string     `json:"-"`
+	DeviceID       string     `json:"device_id,omitempty"`
+	DeviceAssetID  string     `json:"device_asset_id,omitempty"`
+	OriginalName   string     `json:"original_name"`
+	MIMEType       string     `json:"mime_type"`
+	CapturedAt     *time.Time `json:"captured_at,omitempty"`
+	ExpectedSize   int64      `json:"expected_size"`
+	ExpectedSHA256 string     `json:"expected_sha256,omitempty"`
+	ReceivedSize   int64      `json:"received_size"`
+	TempPath       string     `json:"-"`
+	Status         string     `json:"status"`
+	MediaAssetID   string     `json:"media_asset_id,omitempty"`
+	ErrorMessage   string     `json:"error_message,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	ExpiresAt      time.Time  `json:"expires_at"`
 }
 
 type CreateUploadRequest struct {
-	OriginalName   string `json:"original_name"`
-	MIMEType       string `json:"mime_type"`
-	ExpectedSize   int64  `json:"size"`
-	ExpectedSHA256 string `json:"sha256"`
-	DeviceID       string `json:"device_id"`
-	DeviceAssetID  string `json:"device_asset_id"`
+	OriginalName   string     `json:"original_name"`
+	MIMEType       string     `json:"mime_type"`
+	ExpectedSize   int64      `json:"size"`
+	ExpectedSHA256 string     `json:"sha256"`
+	DeviceID       string     `json:"device_id"`
+	DeviceAssetID  string     `json:"device_asset_id"`
+	CapturedAt     *time.Time `json:"captured_at,omitempty"`
+}
+
+func ValidCapturedAt(t time.Time) bool {
+	return !t.Before(time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)) &&
+		!t.After(time.Now().Add(24*time.Hour))
 }
 
 func NewService(database *db.DB, dbPath string) (*Service, error) {
@@ -203,6 +211,9 @@ func NewService(database *db.DB, dbPath string) (*Service, error) {
 func (s *Service) StorageRoot() string { return s.storageRoot }
 
 func (s *Service) ImportFile(sourcePath string, opts ImportOptions) (*ImportResult, error) {
+	if opts.CapturedAt != nil && !ValidCapturedAt(*opts.CapturedAt) {
+		return nil, fmt.Errorf("captured_at is outside the supported date range")
+	}
 	if err := s.primaryAvailable(); err != nil {
 		return nil, err
 	}
@@ -228,6 +239,14 @@ func (s *Service) ImportFile(sourcePath string, opts ImportOptions) (*ImportResu
 		}
 		if storedHash, hashErr := hashFile(storedPath); hashErr != nil || storedHash != hash {
 			return nil, fmt.Errorf("existing original failed verification")
+		}
+		if opts.CapturedAt != nil {
+			if _, err := s.db.Exec(`UPDATE media_assets SET captured_at = COALESCE(captured_at, ?)
+				WHERE id = ?`, opts.CapturedAt.UTC(), existing.ID); err != nil {
+				return nil, err
+			}
+			_, _ = s.db.Exec(`UPDATE images SET taken_at = COALESCE(taken_at, ?) WHERE hash = ?`,
+				opts.CapturedAt.UTC(), existing.ID)
 		}
 		if _, err := s.db.Exec(`INSERT INTO storage_copies
 			(media_asset_id, storage_name, storage_path, status, checksum_verified, verified_at)
@@ -288,10 +307,10 @@ func (s *Service) ImportFile(sourcePath string, opts ImportOptions) (*ImportResu
 	_, err = tx.Exec(`
 		INSERT INTO media_assets (
 			id, hash, original_name, storage_path, media_kind, mime_type, file_size,
-			status, imported_at, checksum_verified, preview_status,
+			status, captured_at, imported_at, checksum_verified, preview_status,
 			source_device_id, device_asset_id, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 'verified', ?, 1, 'pending', ?, ?, ?, ?)
-	`, hash, hash, name, destination, kind, mimeType, info.Size(), now,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'verified', ?, ?, 1, 'pending', ?, ?, ?, ?)
+	`, hash, hash, name, destination, kind, mimeType, info.Size(), opts.CapturedAt, now,
 		nullIfEmpty(opts.DeviceID), nullIfEmpty(opts.DeviceAssetID), now, now)
 	if err != nil {
 		if created {
@@ -360,7 +379,7 @@ func (s *Service) generateImageDerivatives(id, path, mimeType, name string, now 
 		captured = meta.TakenAt.UTC()
 	}
 	_, _ = s.db.Exec(`
-		UPDATE media_assets SET width = ?, height = ?, captured_at = ?,
+		UPDATE media_assets SET width = ?, height = ?, captured_at = COALESCE(?, captured_at),
 			preview_status = 'ready', updated_at = ? WHERE id = ?
 	`, meta.Width, meta.Height, captured, now, id)
 	for _, size := range []string{"small", "medium", "large"} {
@@ -395,6 +414,8 @@ func syncLegacyImage(database *db.DB, hash, path, mimeType, name string, meta *v
 		}
 		return ""
 	}())
+	_, _ = database.Exec(`UPDATE images SET taken_at = COALESCE(taken_at,
+		(SELECT captured_at FROM media_assets WHERE id = ?)) WHERE hash = ?`, hash, hash)
 }
 
 func (s *Service) linkDeviceAsset(assetID string, opts ImportOptions, size int64, hash string) error {
@@ -436,7 +457,7 @@ func (s *Service) ListAssets(page, limit int, kind, deviceID, month string) ([]A
 		args = append(args, kind)
 	}
 	if month != "" {
-		filters = append(filters, "strftime('%Y-%m', COALESCE(captured_at, imported_at)) = ?")
+		filters = append(filters, "substr(COALESCE(captured_at, imported_at), 1, 7) = ?")
 		args = append(args, month)
 	}
 	if deviceID != "" {
@@ -660,6 +681,9 @@ func (s *Service) ThumbnailPath(id, size string) (string, error) {
 }
 
 func (s *Service) CreateUpload(ownerID string, req CreateUploadRequest) (*UploadSession, error) {
+	if req.CapturedAt != nil && !ValidCapturedAt(*req.CapturedAt) {
+		return nil, fmt.Errorf("captured_at is outside the supported date range")
+	}
 	if err := s.primaryAvailable(); err != nil {
 		return nil, err
 	}
@@ -700,12 +724,12 @@ func (s *Service) CreateUpload(ownerID string, req CreateUploadRequest) (*Upload
 	_, err = s.db.Exec(`
 		INSERT INTO upload_sessions (
 			id, owner_id, device_id, device_asset_id, original_name, mime_type,
-			expected_size, expected_sha256, received_size, temp_path, status,
+			expected_size, expected_sha256, received_size, temp_path, status, captured_at,
 			created_at, updated_at, expires_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'uploading', ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'uploading', ?, ?, ?, ?)
 	`, id, ownerID, nullIfEmpty(req.DeviceID), nullIfEmpty(req.DeviceAssetID),
 		req.OriginalName, mimeType, req.ExpectedSize, strings.ToLower(req.ExpectedSHA256),
-		tempPath, now, now, expires)
+		tempPath, req.CapturedAt, now, now, expires)
 	if err != nil {
 		_ = os.Remove(tempPath)
 		return nil, err
@@ -716,14 +740,15 @@ func (s *Service) CreateUpload(ownerID string, req CreateUploadRequest) (*Upload
 func (s *Service) GetUpload(id, ownerID string) (*UploadSession, error) {
 	var u UploadSession
 	var deviceID, deviceAssetID, expectedHash, assetID, errorMessage sql.NullString
+	var capturedAt sql.NullTime
 	err := s.db.QueryRow(`
 		SELECT id, owner_id, device_id, device_asset_id, original_name, mime_type,
-			expected_size, expected_sha256, received_size, temp_path, status,
+			expected_size, expected_sha256, received_size, temp_path, status, captured_at,
 			media_asset_id, error_message, created_at, updated_at, expires_at
 		FROM upload_sessions WHERE id = ?
 	`, id).Scan(&u.ID, &u.OwnerID, &deviceID, &deviceAssetID, &u.OriginalName,
 		&u.MIMEType, &u.ExpectedSize, &expectedHash, &u.ReceivedSize, &u.TempPath,
-		&u.Status, &assetID, &errorMessage, &u.CreatedAt, &u.UpdatedAt, &u.ExpiresAt)
+		&u.Status, &capturedAt, &assetID, &errorMessage, &u.CreatedAt, &u.UpdatedAt, &u.ExpiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -738,6 +763,10 @@ func (s *Service) GetUpload(id, ownerID string) (*UploadSession, error) {
 	u.ExpectedSHA256 = expectedHash.String
 	u.MediaAssetID = assetID.String
 	u.ErrorMessage = errorMessage.String
+	if capturedAt.Valid {
+		t := capturedAt.Time.UTC()
+		u.CapturedAt = &t
+	}
 	return &u, nil
 }
 
@@ -819,6 +848,7 @@ func (s *Service) CompleteUpload(id, ownerID string) (*ImportResult, error) {
 		MIMEType:      u.MIMEType,
 		DeviceID:      u.DeviceID,
 		DeviceAssetID: u.DeviceAssetID,
+		CapturedAt:    u.CapturedAt,
 		MoveSource:    true,
 	})
 	if err != nil {

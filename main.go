@@ -37,6 +37,16 @@ func main() {
 		cmd.RunBackfillThumbs(dbPath)
 	case "reconcile-sizes":
 		cmd.RunReconcileSizes(dbPath)
+	case "fix-dates":
+		dryRun := len(os.Args) > 2 && os.Args[2] == "--dry-run"
+		if len(os.Args) > 2 && !dryRun {
+			fmt.Fprintln(os.Stderr, "Usage: fotoro fix-dates [--dry-run]")
+			os.Exit(1)
+		}
+		if err := cmd.RunBackfillCaptureDates(dbPath, dryRun); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	case "backfill-detail":
 		limit := 25
 		if len(os.Args) > 2 {
@@ -90,6 +100,7 @@ Commands:
   backfill     Generate embeddings for existing images
   backfill-thumbs  Generate missing thumbnails
   reconcile-sizes  Measure legacy media sizes for accurate storage totals
+  fix-dates [--dry-run]  Repair timeline dates from embedded metadata or preserved file time
   backfill-detail [count]  Build 2048 px viewing copies of older images (default: 25)
   scheduler    Run scheduled processing (manual)
   setup        Interactive first-time setup wizard
