@@ -227,6 +227,21 @@ func (s *Service) ImportFile(sourcePath string, opts ImportOptions) (*ImportResu
 	if info.Size() < 0 || info.Size() > s.maxSize {
 		return nil, fmt.Errorf("asset size exceeds configured limit")
 	}
+	name := strings.TrimSpace(opts.OriginalName)
+	if name == "" {
+		name = filepath.Base(sourcePath)
+	}
+	mimeType := detectMIMEType(sourcePath, name, opts.MIMEType)
+	kind := mediaKind(mimeType, name)
+	capturedAt := opts.CapturedAt
+	if capturedAt == nil && kind == "image" {
+		// Read capture metadata before committing the import so the first API
+		// response and timeline page don't temporarily use the offload time.
+		if taken := validate.ExtractDateTaken(sourcePath); ValidCapturedAt(taken) {
+			capturedAt = &taken
+		}
+	}
+	opts.CapturedAt = capturedAt
 
 	hash, err := hashFile(sourcePath)
 	if err != nil {
@@ -273,12 +288,6 @@ func (s *Service) ImportFile(sourcePath string, opts ImportOptions) (*ImportResu
 		return &ImportResult{Asset: existing, Duplicate: true}, nil
 	}
 
-	name := strings.TrimSpace(opts.OriginalName)
-	if name == "" {
-		name = filepath.Base(sourcePath)
-	}
-	mimeType := detectMIMEType(sourcePath, name, opts.MIMEType)
-	kind := mediaKind(mimeType, name)
 	destination := s.assetStoragePath(hash, name)
 	if err := os.MkdirAll(filepath.Dir(destination), 0750); err != nil {
 		return nil, err
