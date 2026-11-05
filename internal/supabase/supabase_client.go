@@ -103,47 +103,6 @@ func (c *Client) GetUser(token string) (map[string]interface{}, error) {
 	return user, nil
 }
 
-// ── NODE REGISTRATION (Tailscale IP storage) ────────────────────────────────
-
-// RegisterNode stores the server's Tailscale IP in Supabase
-func (c *Client) RegisterNode(userID, tailscaleIP, tailnetName, magicDNS, nodeName string) error {
-	if c.serviceKey == "" {
-		return fmt.Errorf("SUPABASE_SERVICE_KEY required for admin operations")
-	}
-	
-	payload := map[string]interface{}{
-		"user_id":       userID,
-		"tailscale_ip":  tailscaleIP,
-		"tailnet_name":  tailnetName,
-		"magic_dns":     magicDNS,
-		"node_name":     nodeName,
-		"status":        "online",
-		"last_seen":     time.Now().UTC().Format(time.RFC3339),
-	}
-	
-	body, _ := json.Marshal(payload)
-	req, err := http.NewRequest("POST", c.url+"/rest/v1/nodes", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.serviceKey)
-	req.Header.Set("apikey", c.anonKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Prefer", "resolution=merge-duplicates")
-	
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != 200 && resp.StatusCode != 201 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("register node failed: %d %s", resp.StatusCode, string(body))
-	}
-	return nil
-}
-
 // GetNodeByUserID retrieves a user's node info
 func (c *Client) GetNodeByUserID(userID string) (map[string]interface{}, error) {
 	req, err := http.NewRequest("GET", 

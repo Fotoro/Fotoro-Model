@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 
@@ -24,7 +25,7 @@ func syncNodeAfterSetup(database *db.DB, accessToken, ip, tailnet, magicDNS, nod
 		tailnetURL = "https://" + magicDNS
 	}
 
-	err := cloudsync.SyncNode(accessToken, cloudsync.NodeInfo{
+	err := cloudsync.SyncNode(database, accessToken, cloudsync.NodeInfo{
 		TailscaleIP: ip,
 		TailnetName: tailnet,
 		MagicDNS:    magicDNS,
@@ -38,6 +39,26 @@ func syncNodeAfterSetup(database *db.DB, accessToken, ip, tailnet, magicDNS, nod
 		return
 	}
 	fmt.Println("✅ Server registered on fotoro.vercel.app dashboard")
+}
+
+// RunEndpointKey prints the host-generated recovery key used to unlock the
+// encrypted Tailscale endpoint on each signed-in browser.
+func RunEndpointKey(dbPath string) {
+	database, err := db.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Database error: %v\n", err)
+		os.Exit(1)
+	}
+	defer database.Close()
+
+	key, err := database.GetOrCreateEndpointKey()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Could not read endpoint recovery key: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Endpoint recovery key (copy it into Fotoro on each device):")
+	fmt.Println(base64.RawURLEncoding.EncodeToString(key))
+	fmt.Println("Keep this key private. It is stored only in this host's local database and is not uploaded to Supabase.")
 }
 
 func syncNodeFromDBQuiet(database *db.DB) {

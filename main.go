@@ -81,6 +81,8 @@ func main() {
 		cmd.RunTailscale(os.Args[2], dbPath)
 	case "nodesync":
 		cmd.RunNodeSyncCLI(dbPath)
+	case "endpoint-key":
+		cmd.RunEndpointKey(dbPath)
 	default:
 		fmt.Printf("Unknown command: %s\\n", os.Args[1])
 		printHelp()
@@ -106,6 +108,7 @@ Commands:
   setup        Interactive first-time setup wizard
   login        Sign in via fotoro.vercel.app (links account to this install)
   nodesync     Push Tailscale/server info to the website dashboard
+  endpoint-key Print the host-local key used to unlock the encrypted route on your devices
   system       Show system specs and recommendations
   tailscale    Tailscale operations (connect/disconnect/status)
 

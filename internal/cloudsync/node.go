@@ -2,6 +2,10 @@ package cloudsync
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,6 +28,23 @@ type NodeInfo struct {
 	TailnetURL  string
 }
 
+type nodeEndpointEnvelope struct {
+	Version    int    `json:"version"`
+	Algorithm  string `json:"algorithm"`
+	Nonce      string `json:"nonce"`
+	Ciphertext string `json:"ciphertext"`
+}
+
+type nodeEndpointDetails struct {
+	TailscaleIP string `json:"tailscale_ip"`
+	TailnetName string `json:"tailnet_name,omitempty"`
+	MagicDNS    string `json:"magic_dns,omitempty"`
+	PublicURL   string `json:"public_url,omitempty"`
+	TailnetURL  string `json:"tailnet_url,omitempty"`
+}
+
+const nodeEndpointAAD = "fotoro-node-endpoint-v1"
+
 // WebAPIBase returns the website origin (no trailing slash).
 func WebAPIBase() string {
 	if base := strings.TrimSpace(os.Getenv("FOTORO_WEB_URL")); base != "" {
@@ -39,7 +60,10 @@ func WebAPIBase() string {
 }
 
 // SyncNode registers or updates this machine in Supabase via the website API.
-func SyncNode(accessToken string, node NodeInfo) error {
+func SyncNode(database *db.DB, accessToken string, node NodeInfo) error {
+	if database == nil {
+		return fmt.Errorf("missing local database")
+	}
 	if accessToken == "" {
 		return fmt.Errorf("missing access token")
 	}
@@ -50,18 +74,44 @@ func SyncNode(accessToken string, node NodeInfo) error {
 		node.NodeName = "fotoro-server"
 	}
 
+	key, err := database.GetOrCreateEndpointKey()
+	if err != nil {
+		return err
+	}
+	endpoint, err := json.Marshal(nodeEndpointDetails{
+		TailscaleIP: node.TailscaleIP,
+		TailnetName: node.TailnetName,
+		MagicDNS:    node.MagicDNS,
+		PublicURL:   node.PublicURL,
+		TailnetURL:  node.TailnetURL,
+	})
+	if err != nil {
+		return fmt.Errorf("encode node endpoint: %w", err)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return fmt.Errorf("initialize endpoint encryption: %w", err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return fmt.Errorf("initialize endpoint authentication: %w", err)
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return fmt.Errorf("generate endpoint nonce: %w", err)
+	}
+	ciphertext := aead.Seal(nil, nonce, endpoint, []byte(nodeEndpointAAD))
+	envelope := nodeEndpointEnvelope{
+		Version:    1,
+		Algorithm:  "A256GCM",
+		Nonce:      base64.RawURLEncoding.EncodeToString(nonce),
+		Ciphertext: base64.RawURLEncoding.EncodeToString(ciphertext),
+	}
+
 	payload := map[string]interface{}{
-		"tailscale_ip": node.TailscaleIP,
-		"tailnet_name": node.TailnetName,
-		"magic_dns":    node.MagicDNS,
-		"node_name":    node.NodeName,
-		"status":       "online",
-	}
-	if node.PublicURL != "" {
-		payload["public_url"] = node.PublicURL
-	}
-	if node.TailnetURL != "" {
-		payload["tailnet_url"] = node.TailnetURL
+		"node_name":           node.NodeName,
+		"status":              "online",
+		"endpoint_ciphertext": envelope,
 	}
 
 	body, _ := json.Marshal(payload)
@@ -125,7 +175,7 @@ func SyncNodeFromDB(database *db.DB) error {
 			if err != nil {
 				return fmt.Errorf("tailscale connected but no IP in config: %w", err)
 			}
-			return SyncNode(accessToken, node)
+			return SyncNode(database, accessToken, node)
 		}
 		return fmt.Errorf("tailscale not configured — run ./fotoro setup")
 	}
@@ -144,7 +194,7 @@ func SyncNodeFromDB(database *db.DB) error {
 	if node.NodeName == "" {
 		node.NodeName = "fotoro-server"
 	}
-	return SyncNode(accessToken, node)
+	return SyncNode(database, accessToken, node)
 }
 
 func stringField(m map[string]interface{}, key string) string {
@@ -192,7 +242,7 @@ func SyncNodeLive(database *db.DB, ts *tailscale.Manager) error {
 			node.TailnetURL = tailscale.PublicURL(node.MagicDNS)
 		}
 	}
-	if err := SyncNode(accessToken, node); err != nil {
+	if err := SyncNode(database, accessToken, node); err != nil {
 		return err
 	}
 	updates := map[string]interface{}{

@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-const currentSchemaVersion = 3
+const currentSchemaVersion = 4
 
 func (d *DB) migrateVersioned(path string, existing bool) error {
 	var version int
@@ -20,8 +20,17 @@ func (d *DB) migrateVersioned(path string, existing bool) error {
 	if version == currentSchemaVersion {
 		return nil
 	}
+	if version == 3 {
+		if err := d.migrateLocalSecrets(); err != nil {
+			return err
+		}
+		return d.recordSchemaVersion()
+	}
 	if version == 2 {
 		if err := d.migrateMediaLinkKey(); err != nil {
+			return err
+		}
+		if err := d.migrateLocalSecrets(); err != nil {
 			return err
 		}
 		return d.recordSchemaVersion()
@@ -31,6 +40,9 @@ func (d *DB) migrateVersioned(path string, existing bool) error {
 			return err
 		}
 		if err := d.migrateMediaLinkKey(); err != nil {
+			return err
+		}
+		if err := d.migrateLocalSecrets(); err != nil {
 			return err
 		}
 		return d.recordSchemaVersion()
@@ -49,6 +61,9 @@ func (d *DB) migrateVersioned(path string, existing bool) error {
 	if err := d.migrateDashboardMetrics(); err != nil {
 		return err
 	}
+	if err := d.migrateLocalSecrets(); err != nil {
+		return err
+	}
 	var unmatched int
 	if err := d.QueryRow(`SELECT COUNT(*) FROM images i
 		WHERE NOT EXISTS (SELECT 1 FROM media_assets a WHERE a.hash = i.hash)`).Scan(&unmatched); err != nil {
@@ -62,6 +77,17 @@ func (d *DB) migrateVersioned(path string, existing bool) error {
 		return fmt.Errorf("migration integrity check failed: %s: %v", integrity, err)
 	}
 	return d.recordSchemaVersion()
+}
+
+func (d *DB) migrateLocalSecrets() error {
+	if _, err := d.Exec(`CREATE TABLE IF NOT EXISTS local_secrets (
+		name TEXT PRIMARY KEY,
+		value BLOB NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		return fmt.Errorf("create local secrets table: %w", err)
+	}
+	return nil
 }
 
 func (d *DB) migrateMediaLinkKey() error {

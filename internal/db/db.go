@@ -11,6 +11,7 @@ import (
 
 type DB struct {
 	*sql.DB
+	path string
 }
 
 func Open(path string) (*DB, error) {
@@ -29,12 +30,38 @@ func Open(path string) (*DB, error) {
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
 
-	d := &DB{db}
+	d := &DB{DB: db, path: path}
 	if err := d.migrateVersioned(path, existing); err != nil {
 		db.Close()
 		return nil, err
 	}
+	if err := d.restrictFilePermissions(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return d, nil
+}
+
+func (d *DB) restrictFilePermissions() error {
+	if d.path == "" || d.path == ":memory:" || strings.HasPrefix(d.path, "file:") {
+		return nil
+	}
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		path := d.path + suffix
+		info, err := os.Stat(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect database permissions: %w", err)
+		}
+		if info.Mode().IsRegular() {
+			if err := os.Chmod(path, 0600); err != nil {
+				return fmt.Errorf("restrict database file permissions: %w", err)
+			}
+		}
+	}
+	return nil
 }
 
 func (d *DB) Migrate() error {

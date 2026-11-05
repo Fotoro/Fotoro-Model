@@ -15,7 +15,7 @@ flowchart LR
     H -->|signed display URLs when Funnel is enabled| W
 ```
 
-The account service identifies the owner and stores the linked server endpoint. It does not hold the original media. Tailscale provides a network route; the Go API still verifies owner or paired-device credentials. Pairing issues a restricted device token, stored hashed on the host.
+The account service identifies the owner and stores only an AES-GCM-encrypted linked-server endpoint. The Linux host generates and keeps the 256-bit encryption key in its local SQLite database, then encrypts route details before `nodesync`; `./fotoro endpoint-key` displays the recovery key for the owner to enter on signed-in browsers. Supabase does not receive the key or original media. Tailscale provides a network route; the Go API still verifies owner or paired-device credentials. Pairing issues a restricted device token, stored hashed on the host.
 
 ## Media lifecycle
 
@@ -41,6 +41,6 @@ SQLite in WAL mode holds the media catalogue, upload sessions, paired devices, q
 
 ## Operational notes
 
-The host is controlled with `./fotoroctl start`, `./fotoroctl stop` and `./fotoroctl status`. `./fotoro nodesync` refreshes the registered endpoint after an account or route change. `./fotoro fix-dates --dry-run` reports how many older timeline records can be repaired; `./fotoro fix-dates` applies the repair without rewriting originals. File modification time is only an approximation when embedded capture metadata is absent.
+The host is controlled with `./fotoroctl start`, `./fotoroctl stop` and `./fotoroctl status`. `./fotoro nodesync` encrypts and refreshes the registered endpoint after an account or route change. `./fotoro endpoint-key` prints the host-local recovery key to unlock that endpoint on each signed-in browser. Before upgrading the hosted website, apply `Fotoro-Server/site/supabase/node_endpoint_encryption.sql`; it clears the old live plaintext route columns. Then run `nodesync` and enter the displayed key in Account settings on each browser. `./fotoro fix-dates --dry-run` reports how many older timeline records can be repaired; `./fotoro fix-dates` applies the repair without rewriting originals. Images use the embedded EXIF capture date and time when available; file modification time is only an approximation when embedded capture metadata is absent.
 
 The optional model worker processes local analysis jobs. Search vectors and captions are derived data; the archive does not require them to preserve or serve originals. See [storage and retrieval design](STORAGE_RETRIEVAL_DESIGN.md) for display tiers and [the server runbook](SERVER_V1_RUNBOOK.md) for operator checks. This repository contains service code and local data paths; personal databases, library files and credentials are not release artifacts.
