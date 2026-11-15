@@ -1,9 +1,10 @@
 package cmd
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
-	"sync"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -11,6 +12,83 @@ import (
 	"fotoro/internal/ollama"
 	"fotoro/internal/search"
 )
+
+// embedText composes the document text for an image row. Returns false when
+// there is nothing meaningful to embed.
+func embedText(caption, tags, category string) (string, bool) {
+	parts := make([]string, 0, 3)
+	for _, s := range []string{caption, tags, category} {
+		if s = strings.TrimSpace(s); s != "" {
+			parts = append(parts, s)
+		}
+	}
+	if len(parts) == 0 {
+		return "", false
+	}
+	return strings.Join(parts, ". "), true
+}
+
+// BackfillEmbeddings embeds up to limit image rows whose stored vector is
+// missing or was produced by a different model/dimension. Returns the number
+// embedded and the number skipped for lack of text.
+func BackfillEmbeddings(database *sql.DB, client *ollama.EmbedClient, limit int) (done, skipped int, err error) {
+	rows, err := database.Query(`
+		SELECT id, COALESCE(caption,''), COALESCE(tags,''), COALESCE(category,''), hash
+		FROM images
+		WHERE (embedding IS NULL OR embed_model IS NULL OR embed_model != ? OR embed_dim != ?)
+		ORDER BY id LIMIT ?`, client.Model(), client.Dim(), limit)
+	if err != nil {
+		return 0, 0, err
+	}
+	type item struct {
+		id             int
+		caption, tags  string
+		category, hash string
+	}
+	var batch []item
+	for rows.Next() {
+		var it item
+		if err := rows.Scan(&it.id, &it.caption, &it.tags, &it.category, &it.hash); err != nil {
+			rows.Close()
+			return done, skipped, err
+		}
+		batch = append(batch, it)
+	}
+	rows.Close()
+
+	for _, it := range batch {
+		text, ok := embedText(it.caption, it.tags, it.category)
+		if !ok {
+			// Mark as embedded with the current model so it is not rescanned
+			// every pass; a future caption update will re-trigger via
+			// embedded_at only when text exists. Store a NULL embedding.
+			database.Exec(`UPDATE images SET embed_model = ?, embed_dim = ?, embedded_at = ? WHERE id = ?`,
+				client.Model(), client.Dim(), time.Now().UTC(), it.id)
+			skipped++
+			continue
+		}
+		emb, err := client.EmbedDocument(text)
+		if err != nil {
+			return done, skipped, fmt.Errorf("embed %s: %w", it.hash[:12], err)
+		}
+		if _, err := database.Exec(`UPDATE images SET embedding = ?, embed_model = ?, embed_dim = ?, embedded_at = ? WHERE id = ?`,
+			search.FloatsToBytes(emb), client.Model(), len(emb), time.Now().UTC(), it.id); err != nil {
+			return done, skipped, err
+		}
+		done++
+	}
+	return done, skipped, nil
+}
+
+// EmbedPending counts rows still needing an embedding for the current model.
+func EmbedPending(database *sql.DB, client *ollama.EmbedClient) (int, error) {
+	var n int
+	err := database.QueryRow(`
+		SELECT COUNT(*) FROM images
+		WHERE (embedding IS NULL OR embed_model IS NULL OR embed_model != ? OR embed_dim != ?)`,
+		client.Model(), client.Dim()).Scan(&n)
+	return n, err
+}
 
 func RunBackfill(dbPath, model string) {
 	database, err := db.Open(dbPath)
@@ -21,91 +99,33 @@ func RunBackfill(dbPath, model string) {
 
 	client := ollama.NewEmbedClient()
 	if err := client.HealthCheck(); err != nil {
-		fmt.Printf("Embed server not running. Start it with:\n")
-		fmt.Printf("  ./llama-server -m nomic-embed-text-v1.5.f16.gguf --host 127.0.0.1:8082 --embeddings\n")
-		fmt.Printf("Then: EMBED_ADDR=http://127.0.0.1:8082 ./fotoro backfill\n")
+		fmt.Printf("Ollama not reachable. Start it and pull the model:\n")
+		fmt.Printf("  ollama pull embeddinggemma\n")
+		fmt.Printf("Then: ./fotoro backfill\n")
 		os.Exit(1)
 	}
+	fmt.Printf("[INIT] embed model=%s dim=%d\n", client.Model(), client.Dim())
 
-	// Count total to backfill
-	var total int
-	database.QueryRow("SELECT COUNT(*) FROM images WHERE embedding IS NULL").Scan(&total)
-	fmt.Printf("[INIT] %d images need embeddings\n", total)
+	pending, _ := EmbedPending(database.DB, client)
+	fmt.Printf("[INIT] %d images need embeddings\n", pending)
 
-	// Batch fetch for efficiency
-	batchSize := 100
-	offset := 0
 	count := int64(0)
 	start := time.Now()
-
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 4) // 4 concurrent embed requests
-
-	for offset < total {
-		rows, err := database.Query(
-			"SELECT id, caption, hash FROM images WHERE embedding IS NULL LIMIT ? OFFSET ?",
-			batchSize, offset,
-		)
+	for {
+		done, skipped, err := BackfillEmbeddings(database.DB, client, 200)
 		if err != nil {
-			panic(err)
-		}
-
-		var batch []struct {
-			id     int
-			caption string
-			hash   string
-		}
-		for rows.Next() {
-			var id int
-			var caption, hash string
-			rows.Scan(&id, &caption, &hash)
-			batch = append(batch, struct {
-				id      int
-				caption string
-				hash    string
-			}{id, caption, hash})
-		}
-		rows.Close()
-
-		if len(batch) == 0 {
+			fmt.Printf("[FAIL] %v\n", err)
 			break
 		}
-
-		for _, item := range batch {
-			wg.Add(1)
-			sem <- struct{}{}
-			go func(id int, caption, hash string) {
-				defer wg.Done()
-				defer func() { <-sem }()
-
-				text := caption
-				if text == "" {
-					text = "image"
-				}
-
-				emb, err := client.GetEmbedding(text)
-				if err != nil {
-					fmt.Printf("[SKIP] %s: %v\n", hash, err)
-					return
-				}
-
-				blob := search.FloatsToBytes(emb)
-				_, err = database.Exec("UPDATE images SET embedding = ? WHERE id = ?", blob, id)
-				if err != nil {
-					fmt.Printf("[FAIL] %s: DB %v\n", hash, err)
-					return
-				}
-
-				c := atomic.AddInt64(&count, 1)
-				if c%10 == 0 {
-					fmt.Printf("[OK] %d embeddings done... (%.1f sec)\n", c, time.Since(start).Seconds())
-				}
-			}(item.id, item.caption, item.hash)
+		atomic.AddInt64(&count, int64(done))
+		if done == 0 && skipped == 0 {
+			break
 		}
-
-		offset += batchSize
+		fmt.Printf("[OK] %d embeddings, %d skipped... (%.1f sec)\n",
+			atomic.LoadInt64(&count), skipped, time.Since(start).Seconds())
+		if done+skipped < 200 {
+			break
+		}
 	}
-
-	wg.Wait()
 	fmt.Printf("\nDone. Backfilled %d embeddings in %.1f minutes\n", count, time.Since(start).Minutes())
 }

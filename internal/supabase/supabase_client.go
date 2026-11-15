@@ -9,8 +9,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/supabase-community/supabase-go"
 	gotruetypes "github.com/supabase-community/gotrue-go/types"
+	"github.com/supabase-community/supabase-go"
 )
 
 // Client wraps the Supabase Go client with Fotoro-specific helpers
@@ -27,16 +27,16 @@ func NewClient() (*Client, error) {
 	url := os.Getenv("SUPABASE_URL")
 	anonKey := os.Getenv("SUPABASE_ANON_KEY")
 	serviceKey := os.Getenv("SUPABASE_SERVICE_KEY")
-	
+
 	if url == "" || anonKey == "" {
 		return nil, fmt.Errorf("SUPABASE_URL and SUPABASE_ANON_KEY required")
 	}
-	
+
 	client, err := supabase.NewClient(url, anonKey, nil)
 	if err != nil {
 		return nil, fmt.Errorf("supabase init: %w", err)
 	}
-	
+
 	return &Client{
 		client:     client,
 		url:        url,
@@ -71,7 +71,7 @@ func (c *Client) SignIn(email, password string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	
+
 	if data.AccessToken != "" {
 		return data.AccessToken, nil
 	}
@@ -86,18 +86,18 @@ func (c *Client) GetUser(token string) (map[string]interface{}, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("apikey", c.anonKey)
-	
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	
+
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("get user failed: %d %s", resp.StatusCode, string(body))
 	}
-	
+
 	var user map[string]interface{}
 	json.Unmarshal(body, &user)
 	return user, nil
@@ -105,25 +105,25 @@ func (c *Client) GetUser(token string) (map[string]interface{}, error) {
 
 // GetNodeByUserID retrieves a user's node info
 func (c *Client) GetNodeByUserID(userID string) (map[string]interface{}, error) {
-	req, err := http.NewRequest("GET", 
+	req, err := http.NewRequest("GET",
 		c.url+"/rest/v1/nodes?user_id=eq."+userID+"&select=*&limit=1", nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.serviceKey)
 	req.Header.Set("apikey", c.anonKey)
-	
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	
+
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("get node failed: %d", resp.StatusCode)
 	}
-	
+
 	var nodes []map[string]interface{}
 	json.Unmarshal(body, &nodes)
 	if len(nodes) == 0 {
@@ -138,9 +138,9 @@ func (c *Client) UpdateNodeHeartbeat(nodeID string) error {
 		"last_seen": time.Now().UTC().Format(time.RFC3339),
 		"status":    "online",
 	}
-	
+
 	body, _ := json.Marshal(payload)
-	req, err := http.NewRequest("PATCH", 
+	req, err := http.NewRequest("PATCH",
 		c.url+"/rest/v1/nodes?id=eq."+nodeID, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -148,13 +148,13 @@ func (c *Client) UpdateNodeHeartbeat(nodeID string) error {
 	req.Header.Set("Authorization", "Bearer "+c.serviceKey)
 	req.Header.Set("apikey", c.anonKey)
 	req.Header.Set("Content-Type", "application/json")
-	
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != 200 && resp.StatusCode != 204 {
 		return fmt.Errorf("heartbeat failed: %d", resp.StatusCode)
 	}
@@ -170,7 +170,7 @@ func (c *Client) SubscribeToChanges(table string, callback func(map[string]inter
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
-		
+
 		lastCheck := time.Now()
 		for range ticker.C {
 			changes, err := c.getChangesSince(table, lastCheck)
@@ -186,22 +186,22 @@ func (c *Client) SubscribeToChanges(table string, callback func(map[string]inter
 }
 
 func (c *Client) getChangesSince(table string, since time.Time) ([]map[string]interface{}, error) {
-	url := fmt.Sprintf("%s/rest/v1/%s?created_at=gte.%s&select=*", 
+	url := fmt.Sprintf("%s/rest/v1/%s?created_at=gte.%s&select=*",
 		c.url, table, since.Format(time.RFC3339))
-	
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.serviceKey)
 	req.Header.Set("apikey", c.anonKey)
-	
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	
+
 	body, _ := io.ReadAll(resp.Body)
 	var changes []map[string]interface{}
 	json.Unmarshal(body, &changes)
@@ -216,9 +216,9 @@ func (c *Client) UploadBackup(localPath, bucket string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	filename := fmt.Sprintf("fotoro_backup_%s.db", time.Now().Format("20060102_150405"))
-	
+
 	// Use Storage API directly
 	url := fmt.Sprintf("%s/storage/v1/object/%s/%s", c.url, bucket, filename)
 	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
@@ -228,13 +228,13 @@ func (c *Client) UploadBackup(localPath, bucket string) error {
 	req.Header.Set("Authorization", "Bearer "+c.serviceKey)
 	req.Header.Set("apikey", c.anonKey)
 	req.Header.Set("Content-Type", "application/octet-stream")
-	
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != 200 && resp.StatusCode != 201 {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("upload failed: %d %s", resp.StatusCode, string(body))

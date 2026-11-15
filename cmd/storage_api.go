@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 )
@@ -13,6 +14,51 @@ func registerStorageRoutes(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("/api/v1/storage/tiers", s.withAuth(s.handleStorageTiers))
 	mux.HandleFunc("/api/v1/storage/tier/run", s.withAuth(s.handleTierRun))
 	mux.HandleFunc("/api/v1/storage/catalogue-snapshot", s.withAuth(s.handleCatalogueSnapshot))
+	mux.HandleFunc("/api/v1/embed/status", s.withAuth(s.handleEmbedStatus))
+	mux.HandleFunc("/api/v1/embed/backfill", s.withAuth(s.handleEmbedBackfill))
+}
+
+func (s *Server) handleEmbedStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"GET only"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	pending, err := EmbedPending(s.db.DB, s.embed)
+	if err != nil {
+		http.Error(w, `{"error":"embed status unavailable"}`, http.StatusInternalServerError)
+		return
+	}
+	var total, embedded int
+	s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END),0) FROM images`).Scan(&total, &embedded)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"model":           s.embed.Model(),
+		"dim":             s.embed.Dim(),
+		"total_images":    total,
+		"embedded":        embedded,
+		"pending":         pending,
+		"index_vectors":   s.index.Len(),
+		"backend_healthy": s.embed.HealthCheck() == nil,
+	})
+}
+
+func (s *Server) handleEmbedBackfill(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"POST only"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.embed.HealthCheck(); err != nil {
+		http.Error(w, `{"error":"embed backend unreachable"}`, http.StatusServiceUnavailable)
+		return
+	}
+	done, skipped, err := BackfillEmbeddings(s.db.DB, s.embed, 200)
+	if err != nil {
+		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+		return
+	}
+	pending, _ := EmbedPending(s.db.DB, s.embed)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"embedded": done, "skipped": skipped, "pending": pending,
+	})
 }
 
 func (s *Server) handleStorageTiers(w http.ResponseWriter, r *http.Request) {
@@ -146,6 +192,14 @@ func (s *Server) startBackupWorker() {
 				_, _ = s.media.RunTierPass(25)
 				_, _ = s.media.PackWarmAssets(100)
 				_, _ = s.media.CompactPacks(1)
+				if s.embed.HealthCheck() == nil {
+					done, _, err := BackfillEmbeddings(s.db.DB, s.embed, 50)
+					if err == nil && done > 0 {
+						if n, lerr := s.index.LoadNew(s.db.DB); lerr == nil && n > 0 {
+							fmt.Printf("[EMBED] %d new, %d vectors in index\n", done, s.index.Len())
+						}
+					}
+				}
 				s.backgroundActive.Add(-1)
 			case <-verifyTicker.C:
 				s.backgroundActive.Add(1)

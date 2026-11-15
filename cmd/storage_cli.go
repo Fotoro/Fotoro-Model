@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"os"
 	"text/tabwriter"
+	"time"
 
 	"fotoro/internal/db"
 	"fotoro/internal/media"
+	"fotoro/internal/ollama"
 )
 
 func openMediaService(dbPath string) (*media.Service, *db.DB, error) {
@@ -170,6 +172,85 @@ func RunBackup(dbPath string, args []string) {
 		fmt.Fprintln(os.Stderr, "sync runs in the background while the API is on; start it with ./fotoroctl start")
 	default:
 		fmt.Fprintln(os.Stderr, "Usage: fotoro backup {status|snapshot}")
+		os.Exit(2)
+	}
+}
+
+// RunEmbed drives semantic-search embedding ops:
+//
+//	fotoro embed status        - embedded/pending counts for the active model
+//	fotoro embed run [limit]   - embed pending captions (default: all)
+//	fotoro embed check         - verify the embed backend is reachable
+func RunEmbed(dbPath string, args []string) {
+	sub := "status"
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	client := ollama.NewEmbedClient()
+	if sub == "check" {
+		if err := client.HealthCheck(); err != nil {
+			fmt.Printf("embed backend unreachable: %v\nmodel: %s dim: %d\n", err, client.Model(), client.Dim())
+			os.Exit(1)
+		}
+		fmt.Printf("ok: model=%s dim=%d\n", client.Model(), client.Dim())
+		return
+	}
+	database, err := db.Open(dbPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer database.Close()
+
+	switch sub {
+	case "status":
+		pending, err := EmbedPending(database.DB, client)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		var total, embedded int
+		database.QueryRow(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END),0) FROM images`).Scan(&total, &embedded)
+		fmt.Printf("model %s dim %d | embedded %d/%d | pending %d\n",
+			client.Model(), client.Dim(), embedded, total, pending)
+		if err := client.HealthCheck(); err != nil {
+			fmt.Printf("backend unreachable: %v\n", err)
+		} else {
+			fmt.Println("backend ok")
+		}
+	case "run":
+		if err := client.HealthCheck(); err != nil {
+			fmt.Fprintf(os.Stderr, "embed backend unreachable: %v\n", err)
+			os.Exit(1)
+		}
+		limit := 1 << 30
+		if len(args) > 1 {
+			fmt.Sscanf(args[1], "%d", &limit)
+		}
+		start := time.Now()
+		done, skipped := 0, 0
+		for limit > 0 {
+			batch := 200
+			if batch > limit {
+				batch = limit
+			}
+			d, s, err := BackfillEmbeddings(database.DB, client, batch)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "embed failed: %v\n", err)
+				os.Exit(1)
+			}
+			done += d
+			skipped += s
+			if d+s == 0 || d+s < batch {
+				break
+			}
+			limit -= batch
+			fmt.Printf("%d embedded, %d skipped...\n", done, skipped)
+		}
+		fmt.Printf("embedded %d, skipped %d (no text) in %.1fs\n",
+			done, skipped, time.Since(start).Seconds())
+	default:
+		fmt.Fprintln(os.Stderr, "Usage: fotoro embed {status|run [limit]|check}")
 		os.Exit(2)
 	}
 }

@@ -188,8 +188,8 @@ func (s *Service) CompactPacks(limit int) (int, error) {
 		return 0, err
 	}
 	type pack struct {
-		id, path      string
-		live, dead    int64
+		id, path   string
+		live, dead int64
 	}
 	var packs []pack
 	for rows.Next() {

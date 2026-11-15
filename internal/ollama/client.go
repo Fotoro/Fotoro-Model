@@ -229,8 +229,8 @@ Rules:
 				},
 			},
 		},
-		"max_tokens":  96,        // STRICT: ~50 words max
-		"temperature": 0.05,      // NEAR-DETERMINISTIC: barely any creativity
+		"max_tokens":  96,   // STRICT: ~50 words max
+		"temperature": 0.05, // NEAR-DETERMINISTIC: barely any creativity
 		"stop":        []string{"USER:", "ASSISTANT:", "</s>", "|im_end|", "\n"},
 	}
 
@@ -357,13 +357,13 @@ func parseAnalysis(raw string) Analysis {
 func isStopWord(w string) bool {
 	switch w {
 	case "the", "and", "this", "that", "with", "from", "image", "photo", "picture",
-		 "shows", "showing", "depicts", "features", "displays", "appears", "seems",
-		 "looks", "like", "about", "some", "very", "also", "have", "been", "there",
-		 "their", "they", "them", "than", "then", "when", "where", "what", "which",
-		 "who", "will", "would", "could", "should", "may", "might", "must", "can",
-		 "into", "over", "under", "above", "below", "between", "through", "during",
-		 "before", "after", "while", "because", "since", "until", "although",
-		 "however", "therefore", "furthermore", "moreover", "nevertheless":
+		"shows", "showing", "depicts", "features", "displays", "appears", "seems",
+		"looks", "like", "about", "some", "very", "also", "have", "been", "there",
+		"their", "they", "them", "than", "then", "when", "where", "what", "which",
+		"who", "will", "would", "could", "should", "may", "might", "must", "can",
+		"into", "over", "under", "above", "below", "between", "through", "during",
+		"before", "after", "while", "because", "since", "until", "although",
+		"however", "therefore", "furthermore", "moreover", "nevertheless":
 		return true
 	}
 	return false

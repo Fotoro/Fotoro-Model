@@ -188,9 +188,10 @@ func RunIngest(dir, dbPath, model string) {
 			}
 			atomic.AddInt64(&processed, 1)
 
-			if emb, err := embedClient.GetEmbedding(res.analysis.Caption); err == nil {
+			if emb, err := embedClient.EmbedDocument(res.analysis.Caption); err == nil {
 				blob := search.FloatsToBytes(emb)
-				database.Exec("UPDATE images SET embedding = ? WHERE hash = ?", blob, res.meta.Hash)
+				database.Exec(`UPDATE images SET embedding = ?, embed_model = ?, embed_dim = ?, embedded_at = ? WHERE hash = ?`,
+					blob, embedClient.Model(), len(emb), time.Now().UTC(), res.meta.Hash)
 			} else {
 				fmt.Printf("[EMBED] [FAIL] %s: %v\n", filepath.Base(res.path), err)
 			}

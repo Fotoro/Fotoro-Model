@@ -113,8 +113,10 @@ func RunServer(addr, dbPath, model string) {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			if err := idx.LoadFromDB(database.DB); err != nil {
+			if n, err := idx.LoadNew(database.DB); err != nil {
 				fmt.Printf("[WARN] Index reload failed: %v\\n", err)
+			} else if n > 0 {
+				fmt.Printf("[INDEX] merged %d new embeddings (%d total)\n", n, idx.Len())
 			}
 		}
 	}()
@@ -565,7 +567,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 		expander := search.NewQueryExpander()
 		expanded := expander.Expand(q)
-		emb, err := s.embed.GetEmbedding(expanded)
+		emb, err := s.embed.EmbedQuery(expanded)
 		if err == nil && len(emb) > 0 {
 			for _, res := range s.index.Search(emb, 100) {
 				addScore(res.Hash, float64(res.Score)*0.55, time.Time{})
@@ -780,7 +782,7 @@ func (s *Server) handleSimilar(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 			return
 		}
-		emb, err = s.embed.GetEmbedding(analysis.Caption)
+		emb, err = s.embed.EmbedQuery(analysis.Caption)
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 			return

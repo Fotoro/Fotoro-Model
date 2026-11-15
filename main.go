@@ -98,6 +98,8 @@ func main() {
 		cmd.RunCold(dbPath, os.Args[2:])
 	case "backup":
 		cmd.RunBackup(dbPath, os.Args[2:])
+	case "embed":
+		cmd.RunEmbed(dbPath, os.Args[2:])
 	default:
 		fmt.Printf("Unknown command: %s\\n", os.Args[1])
 		printHelp()
@@ -127,6 +129,7 @@ Commands:
   storage      Hot/warm/cold tier report with savings and cache size
   cold         Cold storage ops: status|run [limit]|restore <hash>|compact
   backup       Backup ops: status|snapshot
+  embed        Semantic search ops: status|run [limit]|check
   system       Show system specs and recommendations
   tailscale    Tailscale operations (connect/disconnect/status)
 

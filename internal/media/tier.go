@@ -321,19 +321,19 @@ func (s *Service) PromoteAsset(id string) error {
 
 // TierStats reports the storage ladder for dashboards and CLI.
 type TierStats struct {
-	HotAssets    int64  `json:"hot_assets"`
-	HotBytes     int64  `json:"hot_bytes"`
-	WarmAssets   int64  `json:"warm_assets"`
-	WarmBytes    int64  `json:"warm_bytes"`
-	ColdAssets   int64  `json:"cold_assets"`
-	ColdBytes    int64  `json:"cold_bytes"`
-	ArchiveBytes int64  `json:"archive_bytes"`
-	SavedBytes   int64  `json:"saved_bytes"`
-	Packs        int64  `json:"packs"`
-	PackBytes    int64  `json:"pack_bytes"`
-	CacheBytes   int64  `json:"rehydrated_cache_bytes"`
-	PrimaryFree  int64  `json:"primary_free_bytes"`
-	PrimaryTotal int64  `json:"primary_total_bytes"`
+	HotAssets    int64 `json:"hot_assets"`
+	HotBytes     int64 `json:"hot_bytes"`
+	WarmAssets   int64 `json:"warm_assets"`
+	WarmBytes    int64 `json:"warm_bytes"`
+	ColdAssets   int64 `json:"cold_assets"`
+	ColdBytes    int64 `json:"cold_bytes"`
+	ArchiveBytes int64 `json:"archive_bytes"`
+	SavedBytes   int64 `json:"saved_bytes"`
+	Packs        int64 `json:"packs"`
+	PackBytes    int64 `json:"pack_bytes"`
+	CacheBytes   int64 `json:"rehydrated_cache_bytes"`
+	PrimaryFree  int64 `json:"primary_free_bytes"`
+	PrimaryTotal int64 `json:"primary_total_bytes"`
 }
 
 func (s *Service) TierStats() (*TierStats, error) {

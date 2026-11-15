@@ -120,9 +120,10 @@ func RunDaemon(watchDir, dbPath, model string) {
 				tags, boolToInt(res.analysis.HasText), boolToInt(res.analysis.HasFaces),
 				res.analysis.Orientation, "daemon", time.Now(), res.meta.TakenAt, res.meta.PHash,
 			)
-			if emb, err := embedClient.GetEmbedding(res.analysis.Caption); err == nil {
+			if emb, err := embedClient.EmbedDocument(res.analysis.Caption); err == nil {
 				blob := search.FloatsToBytes(emb)
-				database.Exec("UPDATE images SET embedding = ? WHERE hash = ?", blob, res.meta.Hash)
+				database.Exec(`UPDATE images SET embedding = ?, embed_model = ?, embed_dim = ?, embedded_at = ? WHERE hash = ?`,
+					blob, embedClient.Model(), len(emb), time.Now().UTC(), res.meta.Hash)
 			}
 			fmt.Printf("[OK] %s | %s\n", filepath.Base(res.path), res.analysis.Category)
 		}

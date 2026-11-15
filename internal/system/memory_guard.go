@@ -10,12 +10,12 @@ import (
 
 // MemoryStatus represents current memory state
 type MemoryStatus struct {
-	TotalMB      int64
-	AvailableMB  int64
-	UsedMB       int64
-	SwapTotalMB  int64
-	SwapUsedMB   int64
-	SwapFreeMB   int64
+	TotalMB     int64
+	AvailableMB int64
+	UsedMB      int64
+	SwapTotalMB int64
+	SwapUsedMB  int64
+	SwapFreeMB  int64
 }
 
 // GetMemoryStatus reads current memory info from /proc/meminfo
@@ -62,9 +62,9 @@ func CanStartLLM(modelPath string) (bool, string) {
 
 	// Estimate model size
 	modelSizeMB := estimateModelSizeMB(modelPath)
-	
+
 	// Need: model_size * 1.3 (for overhead) + 2GB buffer
-	requiredMB := int64(float64(modelSizeMB) * 1.3) + 2048
+	requiredMB := int64(float64(modelSizeMB)*1.3) + 2048
 
 	// Check available RAM
 	if mem.AvailableMB < requiredMB {
@@ -72,7 +72,7 @@ func CanStartLLM(modelPath string) (bool, string) {
 		if mem.SwapFreeMB < (requiredMB - mem.AvailableMB) {
 			return false, fmt.Sprintf(
 				"Insufficient memory: need ~%d MB, have %d MB available, %d MB swap free. "+
-				"Close other applications or use a smaller model.",
+					"Close other applications or use a smaller model.",
 				requiredMB, mem.AvailableMB, mem.SwapFreeMB,
 			)
 		}
@@ -84,7 +84,7 @@ func CanStartLLM(modelPath string) (bool, string) {
 		if swapPercent > 50 {
 			return false, fmt.Sprintf(
 				"Swap usage too high (%.1f%%). System may become unresponsive. "+
-				"Free up memory before starting LLM.",
+					"Free up memory before starting LLM.",
 				swapPercent,
 			)
 		}
@@ -104,7 +104,7 @@ func MonitorSwap(thresholdPercent float64, killFunc func()) {
 			if mem.SwapTotalMB > 0 {
 				swapPercent := float64(mem.SwapUsedMB) / float64(mem.SwapTotalMB) * 100
 				if swapPercent > thresholdPercent {
-					fmt.Printf("[MEMORY GUARD] Swap at %.1f%% (threshold %.1f%%). Killing LLM...\\n", 
+					fmt.Printf("[MEMORY GUARD] Swap at %.1f%% (threshold %.1f%%). Killing LLM...\\n",
 						swapPercent, thresholdPercent)
 					killFunc()
 					return

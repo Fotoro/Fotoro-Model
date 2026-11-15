@@ -13,10 +13,10 @@ import (
 
 // AuthPipelineResult is returned after Fotoro sign-in + Tailscale setup.
 type AuthPipelineResult struct {
-	Token        string
-	User         *auth.User
-	LocalUserID  int64
-	Tailscale    *TailscaleSetupResult
+	Token       string
+	User        *auth.User
+	LocalUserID int64
+	Tailscale   *TailscaleSetupResult
 }
 
 // RunAuthPipeline: (1) Fotoro sign-in, (2) Tailscale, (3) register node on dashboard.
