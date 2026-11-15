@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-const currentSchemaVersion = 4
+const currentSchemaVersion = 5
 
 func (d *DB) migrateVersioned(path string, existing bool) error {
 	var version int
@@ -20,29 +20,8 @@ func (d *DB) migrateVersioned(path string, existing bool) error {
 	if version == currentSchemaVersion {
 		return nil
 	}
-	if version == 3 {
-		if err := d.migrateLocalSecrets(); err != nil {
-			return err
-		}
-		return d.recordSchemaVersion()
-	}
-	if version == 2 {
-		if err := d.migrateMediaLinkKey(); err != nil {
-			return err
-		}
-		if err := d.migrateLocalSecrets(); err != nil {
-			return err
-		}
-		return d.recordSchemaVersion()
-	}
-	if version == 1 {
-		if err := d.migrateDashboardMetrics(); err != nil {
-			return err
-		}
-		if err := d.migrateMediaLinkKey(); err != nil {
-			return err
-		}
-		if err := d.migrateLocalSecrets(); err != nil {
+	if version >= 1 {
+		if err := d.migrateSinceVersion(version); err != nil {
 			return err
 		}
 		return d.recordSchemaVersion()
@@ -58,10 +37,7 @@ func (d *DB) migrateVersioned(path string, existing bool) error {
 	if err := d.ExtendedMigrate(); err != nil {
 		return fmt.Errorf("migrate media schema: %w", err)
 	}
-	if err := d.migrateDashboardMetrics(); err != nil {
-		return err
-	}
-	if err := d.migrateLocalSecrets(); err != nil {
+	if err := d.migrateSinceVersion(0); err != nil {
 		return err
 	}
 	var unmatched int
@@ -77,6 +53,101 @@ func (d *DB) migrateVersioned(path string, existing bool) error {
 		return fmt.Errorf("migration integrity check failed: %s: %v", integrity, err)
 	}
 	return d.recordSchemaVersion()
+}
+
+// migrateSinceVersion applies every incremental migration introduced after the
+// given stored schema version. All steps are idempotent.
+func (d *DB) migrateSinceVersion(version int) error {
+	steps := []struct {
+		since int
+		run   func() error
+	}{
+		{1, d.migrateDashboardMetrics},
+		{2, d.migrateMediaLinkKey},
+		{3, d.migrateLocalSecrets},
+		{4, d.migrateTieredStorage},
+		{4, d.migrateSearchMeta},
+	}
+	for _, step := range steps {
+		if version > step.since {
+			continue
+		}
+		if err := step.run(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *DB) migrateTieredStorage() error {
+	stmts := []string{
+		`ALTER TABLE media_assets ADD COLUMN tier TEXT NOT NULL DEFAULT 'hot'`,
+		`ALTER TABLE media_assets ADD COLUMN last_accessed_at DATETIME`,
+		`ALTER TABLE media_assets ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE media_assets ADD COLUMN archive_path TEXT`,
+		`ALTER TABLE media_assets ADD COLUMN archive_codec TEXT`,
+		`ALTER TABLE media_assets ADD COLUMN archive_size INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE media_assets ADD COLUMN archive_sha256 TEXT`,
+		`ALTER TABLE media_assets ADD COLUMN archived_at DATETIME`,
+		`CREATE TABLE IF NOT EXISTS cold_packs (
+			id TEXT PRIMARY KEY,
+			month TEXT NOT NULL,
+			storage_path TEXT NOT NULL,
+			member_count INTEGER NOT NULL DEFAULT 0,
+			live_bytes INTEGER NOT NULL DEFAULT 0,
+			dead_bytes INTEGER NOT NULL DEFAULT 0,
+			pack_sha256 TEXT,
+			status TEXT NOT NULL DEFAULT 'open',
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			sealed_at DATETIME
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_cold_packs_status ON cold_packs(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_cold_packs_month ON cold_packs(month)`,
+		`CREATE TABLE IF NOT EXISTS cold_members (
+			media_asset_id TEXT PRIMARY KEY REFERENCES media_assets(id) ON DELETE CASCADE,
+			pack_id TEXT NOT NULL REFERENCES cold_packs(id),
+			member_offset INTEGER NOT NULL,
+			member_length INTEGER NOT NULL,
+			codec TEXT NOT NULL,
+			raw_size INTEGER NOT NULL,
+			state TEXT NOT NULL DEFAULT 'live',
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_cold_members_pack ON cold_members(pack_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_media_assets_tier ON media_assets(tier)`,
+		`CREATE INDEX IF NOT EXISTS idx_media_assets_access ON media_assets(last_accessed_at)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := d.Exec(stmt); err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") ||
+				strings.Contains(err.Error(), "already exists") ||
+				strings.Contains(err.Error(), "no such table") {
+				continue
+			}
+			return fmt.Errorf("tiered storage migration: %q: %w", stmt[:50], err)
+		}
+	}
+	return nil
+}
+
+func (d *DB) migrateSearchMeta() error {
+	stmts := []string{
+		`ALTER TABLE images ADD COLUMN embed_model TEXT`,
+		`ALTER TABLE images ADD COLUMN embed_dim INTEGER`,
+		`ALTER TABLE images ADD COLUMN embedded_at DATETIME`,
+		`CREATE INDEX IF NOT EXISTS idx_images_embedded_at ON images(embedded_at)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := d.Exec(stmt); err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") ||
+				strings.Contains(err.Error(), "already exists") ||
+				strings.Contains(err.Error(), "no such table") {
+				continue
+			}
+			return fmt.Errorf("search meta migration: %q: %w", stmt[:50], err)
+		}
+	}
+	return nil
 }
 
 func (d *DB) migrateLocalSecrets() error {
