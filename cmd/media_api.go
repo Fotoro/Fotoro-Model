@@ -100,11 +100,12 @@ func (s *Server) handleMediaItem(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"GET or HEAD only"}`, http.StatusMethodNotAllowed)
 			return
 		}
-		mediaPath, mimeType, err := s.media.ContentPath(id)
+		mediaPath, mimeType, err := s.media.ContentPathTiered(id)
 		if err != nil {
 			writeMediaError(w, err)
 			return
 		}
+		s.media.TrackAccess(id)
 		w.Header().Set("Content-Type", mimeType)
 		w.Header().Set("Cache-Control", "private, max-age=3600")
 		http.ServeFile(w, r, mediaPath) // Supports byte ranges for video playback.

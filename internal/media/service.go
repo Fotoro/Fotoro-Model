@@ -248,7 +248,7 @@ func (s *Service) ImportFile(sourcePath string, opts ImportOptions) (*ImportResu
 		return nil, err
 	}
 	if existing, err := s.GetAsset(hash); err == nil {
-		storedPath, _, pathErr := s.ContentPath(existing.ID)
+		storedPath, _, pathErr := s.ContentPathTiered(existing.ID)
 		if pathErr != nil {
 			return nil, pathErr
 		}

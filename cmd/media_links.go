@@ -141,7 +141,8 @@ func (s *Server) handleSignedMedia(w http.ResponseWriter, r *http.Request) {
 	}
 	var path, mimeType string
 	if parts[1] == "original" {
-		path, mimeType, err = s.media.ContentPath(parts[0])
+		path, mimeType, err = s.media.ContentPathTiered(parts[0])
+		s.media.TrackAccess(parts[0])
 	} else {
 		path, err = s.media.ThumbnailPath(parts[0], parts[1])
 		mimeType = "image/jpeg"
