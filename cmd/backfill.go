@@ -35,7 +35,7 @@ func BackfillEmbeddings(database *sql.DB, client *ollama.EmbedClient, limit int)
 	rows, err := database.Query(`
 		SELECT id, COALESCE(caption,''), COALESCE(tags,''), COALESCE(category,''), hash
 		FROM images
-		WHERE (embedding IS NULL OR embed_model IS NULL OR embed_model != ? OR embed_dim != ?)
+		WHERE (embed_model IS NULL OR embed_model != ? OR embed_dim != ?)
 		ORDER BY id LIMIT ?`, client.Model(), client.Dim(), limit)
 	if err != nil {
 		return 0, 0, err
@@ -85,7 +85,7 @@ func EmbedPending(database *sql.DB, client *ollama.EmbedClient) (int, error) {
 	var n int
 	err := database.QueryRow(`
 		SELECT COUNT(*) FROM images
-		WHERE (embedding IS NULL OR embed_model IS NULL OR embed_model != ? OR embed_dim != ?)`,
+		WHERE (embed_model IS NULL OR embed_model != ? OR embed_dim != ?)`,
 		client.Model(), client.Dim()).Scan(&n)
 	return n, err
 }

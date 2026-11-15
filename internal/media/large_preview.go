@@ -42,6 +42,10 @@ func (s *Service) BackfillLargePreviews(ctx context.Context, limit int) (int, er
 		if err := ctx.Err(); err != nil {
 			return completed, err
 		}
+		// Tiered assets resolve through the decode cache.
+		if path, _, pathErr := s.ContentPathTiered(item.id); pathErr == nil {
+			item.path = path
+		}
 		actualHash, err := hashFile(item.path)
 		if err != nil {
 			return completed, fmt.Errorf("original %s failed verification: %w", item.id[:8], err)

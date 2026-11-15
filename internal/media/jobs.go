@@ -42,6 +42,10 @@ func (s *Service) ProcessDerivativeJobs(ctx context.Context, limit int) (int, er
 			WHERE media_asset_id = ? AND job_type = 'thumbnail'`, now, id); err != nil {
 			return completed, err
 		}
+		// Tiered assets rehydrate into the decode cache on demand.
+		if contentPath, contentMime, pathErr := s.ContentPathTiered(id); pathErr == nil {
+			path, mimeType = contentPath, contentMime
+		}
 		if err := s.generateImageDerivatives(id, path, mimeType, name, now); err != nil {
 			if _, updateErr := s.db.Exec(`UPDATE analysis_jobs SET status = 'failed',
 				error_message = ?, updated_at = ? WHERE media_asset_id = ? AND job_type = 'thumbnail'`,
