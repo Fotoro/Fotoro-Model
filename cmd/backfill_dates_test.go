@@ -34,14 +34,14 @@ func TestBackfillCaptureDatesDryRunAndPreservedFileTime(t *testing.T) {
 	if _, err := database.Exec(`INSERT INTO images (path, hash) VALUES (?, 'legacy-1')`, photo); err != nil {
 		t.Fatal(err)
 	}
-	if err := RunBackfillCaptureDates(path, true); err != nil {
+	if err := RunBackfillCaptureDates(path, true, false, false); err != nil {
 		t.Fatal(err)
 	}
 	var count int
 	if err := database.QueryRow(`SELECT COUNT(*) FROM media_assets WHERE captured_at IS NOT NULL`).Scan(&count); err != nil || count != 0 {
 		t.Fatalf("dry run changed a date: count=%d err=%v", count, err)
 	}
-	if err := RunBackfillCaptureDates(path, false); err != nil {
+	if err := RunBackfillCaptureDates(path, false, false, false); err != nil {
 		t.Fatal(err)
 	}
 	var captured, legacy time.Time
@@ -53,5 +53,23 @@ func TestBackfillCaptureDatesDryRunAndPreservedFileTime(t *testing.T) {
 	}
 	if !captured.Equal(want) || !legacy.Equal(want) {
 		t.Fatalf("capture dates = %v, %v; want %v", captured, legacy, want)
+	}
+}
+
+func TestInferDateFromName(t *testing.T) {
+	cases := map[string]time.Time{
+		"IMG_20240315_142530.jpg":                    time.Date(2024, 3, 15, 14, 25, 30, 0, time.UTC),
+		"PXL_20240101_000102999.jpg":                 time.Date(2024, 1, 1, 0, 1, 2, 0, time.UTC),
+		"Screenshot_2024-03-15-14-25-30-123_com.png": time.Date(2024, 3, 15, 14, 25, 30, 0, time.UTC),
+		"signal-2024-03-15-142530.jpg":               time.Date(2024, 3, 15, 14, 25, 30, 0, time.UTC),
+		"WhatsApp Image 2024-03-15 at 14.25.30.jpeg": time.Date(2024, 3, 15, 14, 25, 30, 0, time.UTC),
+		"mmexport1710505530000.jpg":                  time.Date(2024, 3, 15, 12, 25, 30, 0, time.UTC),
+		"random.jpg":                                 {},
+		"IMG_20241315_142530.jpg":                    {}, // month 13 rejected
+	}
+	for name, want := range cases {
+		if got := inferDateFromName(name); !got.Equal(want) {
+			t.Errorf("%s: got %v want %v", name, got, want)
+		}
 	}
 }
