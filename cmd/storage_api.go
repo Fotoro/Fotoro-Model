@@ -13,6 +13,7 @@ func registerStorageRoutes(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("/api/v1/storage/verify", s.withAuth(s.handleStorageVerify))
 	mux.HandleFunc("/api/v1/storage/tiers", s.withAuth(s.handleStorageTiers))
 	mux.HandleFunc("/api/v1/storage/tier/run", s.withAuth(s.handleTierRun))
+	mux.HandleFunc("/api/v1/storage/health", s.withAuth(s.handleStorageHealth))
 	mux.HandleFunc("/api/v1/storage/catalogue-snapshot", s.withAuth(s.handleCatalogueSnapshot))
 	mux.HandleFunc("/api/v1/embed/status", s.withAuth(s.handleEmbedStatus))
 	mux.HandleFunc("/api/v1/embed/backfill", s.withAuth(s.handleEmbedBackfill))
