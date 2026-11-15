@@ -24,6 +24,60 @@ func registerMediaV1Routes(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("/api/v1/uploads/", s.withAuth(s.handleUploadItem))
 	mux.HandleFunc("/api/v1/device-assets/status", s.withAuth(s.handleDeviceAssetStatus))
 	mux.HandleFunc("/api/v1/me", s.withAuth(s.handleV1Me))
+	mux.HandleFunc("/api/v1/calendar", s.withAuth(s.handleCalendar))
+	mux.HandleFunc("/api/v1/calendar/day", s.withAuth(s.handleCalendarDay))
+	mux.HandleFunc("/api/v1/memories/on-this-day", s.withAuth(s.handleOnThisDay))
+}
+
+func (s *Server) handleCalendar(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"GET only"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	years, missing, err := s.media.Calendar()
+	if err != nil {
+		http.Error(w, `{"error":"calendar unavailable"}`, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"years":                 years,
+		"missing_capture_dates": missing,
+	})
+}
+
+func (s *Server) handleCalendarDay(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"GET only"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	day := strings.TrimSpace(r.URL.Query().Get("date"))
+	if len(day) != 10 || day[4] != '-' || day[7] != '-' {
+		http.Error(w, `{"error":"date must be YYYY-MM-DD"}`, http.StatusBadRequest)
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	assets, err := s.media.ListAssetsByDay(day, limit)
+	if err != nil {
+		http.Error(w, `{"error":"could not list day"}`, http.StatusInternalServerError)
+		return
+	}
+	s.attachDirectMediaLinks(assets)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"media": assets, "date": day})
+}
+
+func (s *Server) handleOnThisDay(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"GET only"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	perYear, _ := strconv.Atoi(r.URL.Query().Get("per_year"))
+	assets, err := s.media.OnThisDay(perYear)
+	if err != nil {
+		http.Error(w, `{"error":"memories unavailable"}`, http.StatusInternalServerError)
+		return
+	}
+	s.attachDirectMediaLinks(assets)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"media": assets})
 }
 
 func (s *Server) handleV1Me(w http.ResponseWriter, r *http.Request) {
@@ -53,6 +107,20 @@ func (s *Server) handleMediaList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deviceID := strings.TrimSpace(r.URL.Query().Get("device_id"))
+	if cursor := strings.TrimSpace(r.URL.Query().Get("cursor")); cursor != "" ||
+		r.URL.Query().Get("mode") == "cursor" {
+		assets, next, err := s.media.ListAssetsCursor(cursor, limit, kind)
+		if err != nil {
+			http.Error(w, `{"error":"bad cursor or query"}`, http.StatusBadRequest)
+			return
+		}
+		s.attachDirectMediaLinks(assets)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"media":       assets,
+			"next_cursor": next,
+		})
+		return
+	}
 	assets, total, err := s.media.ListAssets(page, limit, kind, deviceID, month)
 	if err != nil {
 		http.Error(w, `{"error":"could not list media"}`, http.StatusInternalServerError)

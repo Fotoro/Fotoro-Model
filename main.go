@@ -38,12 +38,21 @@ func main() {
 	case "reconcile-sizes":
 		cmd.RunReconcileSizes(dbPath)
 	case "fix-dates":
-		dryRun := len(os.Args) > 2 && os.Args[2] == "--dry-run"
-		if len(os.Args) > 2 && !dryRun {
-			fmt.Fprintln(os.Stderr, "Usage: fotoro fix-dates [--dry-run]")
-			os.Exit(1)
+		var dryRun, preferEXIF, inferNames bool
+		for _, arg := range os.Args[2:] {
+			switch arg {
+			case "--dry-run":
+				dryRun = true
+			case "--prefer-exif":
+				preferEXIF = true
+			case "--infer-names":
+				inferNames = true
+			default:
+				fmt.Fprintln(os.Stderr, "Usage: fotoro fix-dates [--dry-run] [--prefer-exif] [--infer-names]")
+				os.Exit(1)
+			}
 		}
-		if err := cmd.RunBackfillCaptureDates(dbPath, dryRun); err != nil {
+		if err := cmd.RunBackfillCaptureDates(dbPath, dryRun, preferEXIF, inferNames); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
