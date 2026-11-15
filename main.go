@@ -83,6 +83,12 @@ func main() {
 		cmd.RunNodeSyncCLI(dbPath)
 	case "endpoint-key":
 		cmd.RunEndpointKey(dbPath)
+	case "storage":
+		cmd.RunStorage(dbPath)
+	case "cold":
+		cmd.RunCold(dbPath, os.Args[2:])
+	case "backup":
+		cmd.RunBackup(dbPath, os.Args[2:])
 	default:
 		fmt.Printf("Unknown command: %s\\n", os.Args[1])
 		printHelp()
@@ -109,6 +115,9 @@ Commands:
   login        Sign in via fotoro.vercel.app (links account to this install)
   nodesync     Push Tailscale/server info to the website dashboard
   endpoint-key Print the host-local key used to unlock the encrypted route on your devices
+  storage      Hot/warm/cold tier report with savings and cache size
+  cold         Cold storage ops: status|run [limit]|restore <hash>|compact
+  backup       Backup ops: status|snapshot
   system       Show system specs and recommendations
   tailscale    Tailscale operations (connect/disconnect/status)
 
