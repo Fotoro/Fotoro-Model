@@ -1,5 +1,15 @@
 # Fotoro v2 expansion design
 
+> Status: implemented. `internal/jxl` (libjxl cgo, effort 4, ~18% measured on
+> real JPEGs), `internal/cold` (codecs, warm files, packs), tier engine +
+> serving rehydration in `internal/media/tier.go`, pack builder/compaction in
+> `internal/media/pack.go`, artifact-aware backup + catalogue snapshots in
+> `internal/media/backup.go`, calendar/cursor APIs in `internal/media/calendar.go`,
+> EmbeddingGemma via Ollama in `internal/ollama/embed.go` + `internal/search`,
+> operator surface: `fotoro storage|cold|backup|embed`, `/api/v1/storage/*`,
+> `/api/v1/embed/*`, `/api/v1/calendar*`, `/api/v1/memories/on-this-day`.
+> Operator docs: docs/COLD_STORAGE.md, docs/RECOVERY.md.
+
 Goal: turn Fotoro into the self-hosted archive people migrate to: dramatically
 lower storage footprint at 100k+ images, near-instant access to cold data,
 offline semantic search on modest hardware, capture-date-native organization,
