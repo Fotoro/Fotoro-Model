@@ -172,6 +172,11 @@ func NewService(database *db.DB, dbPath string) (*Service, error) {
 		if backupMount == "" {
 			return nil, fmt.Errorf("FOTORO_BACKUP_MOUNT_DIR is required with FOTORO_BACKUP_DIR")
 		}
+		if nested, err := pathsNested(storageRoot, backupRoot); err != nil {
+			return nil, fmt.Errorf("cannot compare storage directories: %w", err)
+		} else if nested {
+			return nil, fmt.Errorf("primary and secondary storage must not contain each other")
+		}
 		if err := validateMount(backupRoot, backupMount, filesystemDevice); err != nil {
 			return nil, fmt.Errorf("secondary mount: %w", err)
 		}
@@ -1088,6 +1093,31 @@ func sameFilePath(a, b string) bool {
 	aa, _ := filepath.Abs(a)
 	bb, _ := filepath.Abs(b)
 	return aa == bb
+}
+
+// pathsNested reports whether either directory contains the other — an unsafe
+// backup layout where a "second copy" still lives on the primary tree.
+func pathsNested(a, b string) (bool, error) {
+	aa, err := filepath.Abs(a)
+	if err != nil {
+		return false, err
+	}
+	bb, err := filepath.Abs(b)
+	if err != nil {
+		return false, err
+	}
+	rel, err := filepath.Rel(aa, bb)
+	if err != nil {
+		return false, err
+	}
+	if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
+		return true, nil
+	}
+	rel, err = filepath.Rel(bb, aa)
+	if err != nil {
+		return false, err
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)), nil
 }
 
 func nullIfEmpty(value string) interface{} {

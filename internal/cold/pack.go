@@ -73,6 +73,9 @@ func (w *PackWriter) Add(hash string, codec Codec, rawSize int64, payload []byte
 	return nil
 }
 
+// Offset is the byte position where the next member would be written.
+func (w *PackWriter) Offset() int64 { return w.off }
+
 // Seal appends the index footer and fsyncs; the pack is complete only after
 // this returns nil.
 func (w *PackWriter) Seal() error {
@@ -187,20 +190,30 @@ func (r *PackReader) Member(hash string) (PackMember, bool) {
 
 // ReadMember returns the decoded original bytes of a member.
 func (r *PackReader) ReadMember(hash string) ([]byte, error) {
-	m, ok := r.idx.Members[hash]
-	if !ok {
-		return nil, fmt.Errorf("member %s not in pack", hash)
-	}
-	buf := make([]byte, m.Length)
-	if _, err := r.f.ReadAt(buf, m.Offset); err != nil && err != io.EOF {
+	blob, rawSize, codec, err := r.ReadMemberRaw(hash)
+	if err != nil {
 		return nil, err
 	}
-	out, err := Decode(m.Codec, buf)
+	out, err := Decode(codec, blob)
 	if err != nil {
 		return nil, fmt.Errorf("decode pack member %s: %w", hash, err)
 	}
-	if int64(len(out)) != m.RawSize {
-		return nil, fmt.Errorf("decoded size %d != index %d", len(out), m.RawSize)
+	if int64(len(out)) != rawSize {
+		return nil, fmt.Errorf("decoded size %d != index %d", len(out), rawSize)
 	}
 	return out, nil
+}
+
+// ReadMemberRaw returns the stored payload without decoding — used by pack
+// compaction which moves bytes rather than recompressing them.
+func (r *PackReader) ReadMemberRaw(hash string) ([]byte, int64, Codec, error) {
+	m, ok := r.idx.Members[hash]
+	if !ok {
+		return nil, 0, 0, fmt.Errorf("member %s not in pack", hash)
+	}
+	buf := make([]byte, m.Length)
+	if _, err := r.f.ReadAt(buf, m.Offset); err != nil && err != io.EOF {
+		return nil, 0, 0, err
+	}
+	return buf, m.RawSize, m.Codec, nil
 }

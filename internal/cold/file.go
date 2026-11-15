@@ -67,6 +67,35 @@ func ReadFileHeader(path string) (Codec, int64, error) {
 	return Codec(hdr[8]), int64(binary.LittleEndian.Uint64(hdr[9:])), nil
 }
 
+// ReadPayload returns the still-compressed payload of a warm archive —
+// used when moving members into packs without recompressing.
+func ReadPayload(path string) (Codec, []byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return 0, nil, err
+	}
+	if st.Size() < fileHeaderLen {
+		return 0, nil, errors.New("archive too small")
+	}
+	hdr := make([]byte, fileHeaderLen)
+	if _, err := f.ReadAt(hdr, 0); err != nil {
+		return 0, nil, err
+	}
+	if string(hdr[:8]) != string(fileMagic) {
+		return 0, nil, errors.New("bad archive magic")
+	}
+	payload := make([]byte, st.Size()-fileHeaderLen)
+	if _, err := f.ReadAt(payload, fileHeaderLen); err != nil {
+		return 0, nil, err
+	}
+	return Codec(hdr[8]), payload, nil
+}
+
 // ReadFile returns the decoded original bytes of a warm archive.
 func ReadFile(path string) ([]byte, error) {
 	f, err := os.Open(path)

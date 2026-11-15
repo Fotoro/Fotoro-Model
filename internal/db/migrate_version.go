@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-const currentSchemaVersion = 5
+const currentSchemaVersion = 6
 
 func (d *DB) migrateVersioned(path string, existing bool) error {
 	var version int
@@ -67,6 +67,7 @@ func (d *DB) migrateSinceVersion(version int) error {
 		{3, d.migrateLocalSecrets},
 		{4, d.migrateTieredStorage},
 		{4, d.migrateSearchMeta},
+		{5, d.migratePackBackup},
 	}
 	for _, step := range steps {
 		if version > step.since {
@@ -125,6 +126,23 @@ func (d *DB) migrateTieredStorage() error {
 				continue
 			}
 			return fmt.Errorf("tiered storage migration: %q: %w", stmt[:50], err)
+		}
+	}
+	return nil
+}
+
+func (d *DB) migratePackBackup() error {
+	stmts := []string{
+		`ALTER TABLE cold_packs ADD COLUMN backup_path TEXT`,
+		`ALTER TABLE cold_packs ADD COLUMN backed_up_at DATETIME`,
+	}
+	for _, stmt := range stmts {
+		if _, err := d.Exec(stmt); err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") ||
+				strings.Contains(err.Error(), "no such table") {
+				continue
+			}
+			return fmt.Errorf("pack backup migration: %w", err)
 		}
 	}
 	return nil
